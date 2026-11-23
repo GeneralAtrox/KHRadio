@@ -1,8 +1,8 @@
-// KH Radio - rapidjson helpers copied from MPC-BE's rapidjsonHelper.h. GPL-3.0-or-later.
+// KH Radio - rapidjson helpers, derived from MPC-BE's rapidjsonHelper.h. GPL-3.0-or-later.
 #pragma once
 
 #include <type_traits>
-#include "rapidjson/document.h"
+#include "RapidJson.h"
 #include "TextUtil.h"
 
 template <typename T>
@@ -53,4 +53,12 @@ inline const rapidjson::Value* GetJsonObject(const rapidjson::Value& jsonValue, 
 	}
 
 	return nullptr;
+}
+
+template <typename Writer>
+inline void WriteJsonString(Writer& w, const char* key, const CStringW& value)
+{
+	const CStringA utf8 = WStrToUTF8(value);
+	w.Key(key);
+	w.String(utf8.GetString(), static_cast<rapidjson::SizeType>(utf8.GetLength()));
 }

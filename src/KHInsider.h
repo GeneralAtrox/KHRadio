@@ -1,67 +1,36 @@
 /*
- * (C) 2026 MPC-BE KH Radio edition
- * Adapted for the standalone KH Radio app (no MPC-BE dependencies).
+ * KH Radio - network side of the downloads.khinsider.com scraper: page fetches
+ * through the signed-in browser session, cover downloads, the audio classifier.
  *
- * This file is part of MPC-BE.
+ * Copyright (C) 2026 KH Radio authors.
+ * Derived from the KH Radio panel of the MPC-BE fork (MPC-BE, GPLv3).
  *
- * MPC-BE is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
- *
- * MPC-BE is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
+ * This program is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software
+ * Foundation, either version 3 of the License, or (at your option) any later version.
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ * PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with this
+ * program (COPYING.txt). If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
 
-#include <atlstr.h>
+#include "KHParse.h"
+#include <functional>
 #include <vector>
 
-// Scraper for downloads.khinsider.com used by KH Radio.
 namespace KHInsider
 {
-	struct Track {
-		CStringW name;        // display name
-		CStringW pageUrl;     // track page on downloads.khinsider.com
-		int      durationSec = 0; // length from the album page (0 if unknown)
-	};
+	// Opt-in diagnostics: when set, the last album page and track page fetched
+	// are saved there (album.html / track.html). Empty turns it off.
+	void SetDebugPageDir(const CStringW& dir);
 
-	// Result of analysing a track's audio for the "skip non-music" filter.
-	enum class AudioVerdict {
-		Music,   // keep it
-		Spoken,  // dialogue/drama/narration
-		Quiet,   // (near-)silent / empty
-	};
-
-	struct Album {
-		CStringW url;       // album page URL
-		CStringW title;
-		std::vector<CStringW> coverUrls; // cover candidates, best/smallest first (thumbnails, then full-size as fallback)
-		CStringW platforms; // comma-separated console list ("Saturn, Arcade"), if any
-		std::vector<Track> tracks;
-	};
-
-	// Why a fetch failed, so the UI can show a useful message and we can tell
-	// "site is down / blocking us" apart from "site changed its HTML".
-	enum class FetchStatus {
-		Success,
-		NetworkError,  // no usable response (offline, timeout, DNS)
-		Blocked,       // HTTP 4xx - Cloudflare / bot protection likely changed
-		LayoutChanged, // page fetched but no tracks could be parsed
-		LoginRequired,
-		BrowserUnavailable,
-	};
-
-	// POST body for the random-album-advanced form. Each list holds the numeric
-	// option values of the site's form ("type[]", "year[]", "category[]").
-	CStringA BuildRandomAlbumForm(const std::vector<int>& types, const std::vector<int>& years, const std::vector<int>& platforms);
+	// Called once at exit: every download in progress or about to start gives
+	// up quickly so the worker threads can be joined.
+	void BeginShutdown();
+	bool IsShuttingDown();
 
 	// POST the random-album-advanced form; fills 'album' with title and track pages.
 	bool FetchRandomAlbum(const CStringA& formBody, Album& album, FetchStatus* pStatus = nullptr);
@@ -69,60 +38,30 @@ namespace KHInsider
 	// GET an album page directly (used when replaying an album from history).
 	bool FetchAlbum(const CStringW& albumUrl, Album& album, FetchStatus* pStatus = nullptr);
 
-	// GET a track page and extract the direct audio URL (mp3 preferred).
-	// Returns an empty string on failure.
+	// GET a track page and extract the direct audio URL (mp3 preferred). Returns
+	// an empty string on failure; *pStatus says why (LayoutChanged = the page
+	// loaded but had no usable audio link).
 	CStringW ResolveTrackAudioUrl(const CStringW& trackPageUrl, FetchStatus* pStatus = nullptr);
 
-	// Download a binary resource (e.g. cover image) to a local file.
-	bool DownloadToFile(const CStringW& url, const CStringW& localPath);
+	// Download a cover image to a local file; fails if it is bigger than maxBytes
+	// or not on KHInsider's hosts.
+	bool DownloadToFile(const CStringW& url, const CStringW& localPath, size_t maxBytes);
+
+	// Download a whole track's audio to a file for the audio cache: bounded by
+	// maxBytes, a 4-minute deadline, shutdown and 'cancelled'. Nothing is left
+	// at localPath on failure.
+	bool DownloadAudioToFile(const CStringW& url, const CStringW& localPath, size_t maxBytes, const std::function<bool()>& cancelled);
+
+	// Testing aid (settings.json "preferAudioFormat"): take a track page's link
+	// in this format ("ogg", "m4a", "flac", "mp3") first. Empty = normal order.
+	// Call before any worker starts.
+	void SetPreferredAudioFormat(const CStringW& ext);
 
 	// Download a prefix of the track and classify it as music, spoken, or
-	// (near-)silent, for the "skip non-music tracks" filter.
+	// (near-)silent, for the "skip non-music tracks" filter. Only mp3 is
+	// fetched and analysed here; anything else counts as music.
 	AudioVerdict ClassifyTrackAudio(const CStringW& audioUrl, const CStringW& trackName);
-
-	// True if a title (a track name or a whole album title) contains drama/voice
-	// keywords - lets the radio skip drama-CD / voice albums by title.
-	bool IsSpokenTitle(const CStringW& title);
-
-	// Derive the album page URL from a CDN track audio URL, e.g.
-	// https://nu.vgmtreasurechest.com/soundtracks/<slug>/<hash>/NN.mp3 ->
-	// https://downloads.khinsider.com/game-soundtracks/album/<slug>. Used to
-	// recover a restored playlist's cover after a restart. Empty if not derivable.
-	CStringW AlbumUrlFromAudioUrl(const CStringW& audioUrl);
-
-	CStringW DecodeHtmlEntities(CStringW str);
-
-	// Append a line to %APPDATA%\KHRadio\khradio_debug.log.
-	void DebugLog(const CStringW& msg);
+	// The same analysis on decoded audio (mono, -1..1) - used for Ogg tracks,
+	// whose audio the cache decodes anyway.
+	AudioVerdict ClassifyMonoPcm(const std::vector<float>& mono, int hz, const CStringW& trackName);
 }
-
-// Persistent record of every album/track that has been listened to.
-// Stored as %APPDATA%\KHRadio\khradio_history.json.
-class CKHRadioHistory
-{
-public:
-	struct TrackEntry {
-		CStringW name;
-		int plays = 0;
-	};
-
-	struct AlbumEntry {
-		CStringW url;
-		CStringW title;
-		std::vector<TrackEntry> tracks;
-	};
-
-	void Load();
-	void Save() const;
-
-	bool ContainsAlbum(const CStringW& albumUrl) const;
-	void RecordTrack(const CStringW& albumUrl, const CStringW& albumTitle, const CStringW& trackName);
-
-	// most recently listened first
-	const std::vector<AlbumEntry>& Albums() const { return m_albums; }
-
-private:
-	CStringW GetPath() const;
-
-	std::vector<AlbumEntry> m_albums;
-};

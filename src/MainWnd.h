@@ -3,7 +3,9 @@
 // GPL-3.0-or-later (see COPYING.txt).
 #pragma once
 
+#include <vector>
 #include "KHRadioDlg.h"
+#include "MediaSession.h"
 #include "Player.h"
 #include "UiKit.h"
 
@@ -19,11 +21,11 @@ public:
 
 	// IPlayerListener
 	void OnTrackStarted(int index, bool resumed) override;
-	void OnTrackEnded(int index) override;
 	void OnQueueEnded() override;
 	void OnPlayerError(int index, const CStringW& message) override;
 	void OnQueueChanged() override;
 	void OnStateChanged() override;
+	void OnNeedResolve(int index) override;
 
 protected:
 	void PostNcDestroy() override { delete this; }
@@ -50,11 +52,12 @@ protected:
 	afx_msg LRESULT OnSlider(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnDpiChanged(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnAppCommand(WPARAM wParam, LPARAM lParam);
-	afx_msg LRESULT OnHotKey(WPARAM wParam, LPARAM lParam);
+	afx_msg LRESULT OnMediaButton(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnIconicThumbnail(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnIconicLivePreview(WPARAM wParam, LPARAM lParam);
 
 private:
+	enum class MediaCmd { PlayPause, Play, Pause, Next, Prev };
 	int S(int px) const { return MulDiv(px, m_dpi, 96); }
 	void CreateFonts();
 	void Layout();
@@ -63,8 +66,9 @@ private:
 	void UpdateTitle();
 	void UpdateTimes();
 	void UpdateIconic();
+	void UpdateMediaTrack();
 	void PruneCovers(bool startup);
-	void RegisterMediaKeys();
+	void MediaCommand(MediaCmd cmd, bool fromMediaControls);
 	void SaveState();
 
 	CRadioPlayer m_player;
@@ -73,20 +77,22 @@ private:
 	CSliderBar m_volume;
 	CGlyphButton m_prev, m_play, m_next;
 	CListBox m_queue;
+	CMediaSession m_media;
 
 	CFont m_fontUI, m_fontUIBold, m_fontTitle, m_fontGlyph, m_fontGlyphBig, m_fontGlyphHuge;
 	CBrush m_brushList;
 
 	CCoverImage m_cover;
-	CStringW m_coverAlbum;
 	HBITMAP m_coverScaled = nullptr;
 	CSize m_coverScaledSize;
 	CSize m_coverScaledFor;
 
 	CRect m_rcCover, m_rcTitle, m_rcAlbum, m_rcPlatforms, m_rcElapsed, m_rcTotal, m_rcVolumeIcon, m_rcQueueLabel;
 	UINT m_dpi = 96;
+	std::vector<UINT64> m_listedIds; // queue items shown in the list, in order
 	int m_listedCurrent = -2;
 	int m_tick = 0;
-	bool m_hotkeys = false;
+	ULONGLONG m_lastMediaTick = 0;
+	bool m_lastMediaFromControls = false;
 	bool m_stateSaved = false;
 };

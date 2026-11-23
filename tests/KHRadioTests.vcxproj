@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A3E1C9D4-5B7F-4F2A-8E6D-1C0B9A8F7E21}</ProjectGuid>
+    <Keyword>MFCProj</Keyword>
+    <RootNamespace>KHRadioTests</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseOfMfc>Static</UseOfMfc>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="..\thirdparty\webview2\WebView2.props" />
+  <PropertyGroup>
+    <KHRadioRoot>$(MSBuildThisFileDirectory)..\</KHRadioRoot>
+    <OutDir>$(KHRadioRoot)_build\$(Configuration)\tests\</OutDir>
+    <IntDir>$(KHRadioRoot)_build\obj\tests\$(Configuration)\</IntDir>
+    <TargetName>KHRadioTests</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(KHRadioRoot)src;$(KHRadioRoot)thirdparty;$(KHRadioRoot)thirdparty\rapidjson\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_CONSOLE;UNICODE;_UNICODE;RAPIDJSON_SSE2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <AdditionalDependencies>shlwapi.lib;iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PostBuildEvent>
+      <Message>Copy the hand-written test pages next to the test exe</Message>
+      <Command>xcopy /y /i /q "$(MSBuildThisFileDirectory)fixtures\*.html" "$(OutDir)fixtures\" &gt;nul</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+    </ClCompile>
+    <Link><GenerateDebugInformation>true</GenerateDebugInformation></Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
+    <Link><GenerateDebugInformation>true</GenerateDebugInformation></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="KHRadioTests.cpp" />
+    <ClCompile Include="..\src\AudioCache.cpp" />
+    <ClCompile Include="..\src\FileUtil.cpp" />
+    <ClCompile Include="..\src\History.cpp" />
+    <ClCompile Include="..\src\KHParse.cpp" />
+    <ClCompile Include="..\src\KHWebSession.cpp" />
+    <ClCompile Include="..\src\Log.cpp" />
+    <ClCompile Include="..\thirdparty\stb_vorbis\stb_vorbis.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>STB_VORBIS_NO_PUSHDATA_API;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="fixtures\album.html" />
+    <None Include="fixtures\album_empty.html" />
+    <None Include="fixtures\album_nosonglist.html" />
+    <None Include="fixtures\track_audio.html" />
+    <None Include="fixtures\track_flac.html" />
+    <None Include="fixtures\track_links.html" />
+    <None Include="fixtures\track_m4a.html" />
+    <None Include="fixtures\track_mixed.html" />
+    <None Include="fixtures\track_ogg.html" />
+
+    <None Include="fixtures\track_none.html" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

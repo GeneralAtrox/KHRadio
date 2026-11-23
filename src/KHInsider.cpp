@@ -1,52 +1,47 @@
 /*
- * (C) 2026 MPC-BE KH Radio edition
- * Adapted for the standalone KH Radio app (no MPC-BE dependencies).
+ * KH Radio - network side of the downloads.khinsider.com scraper: page fetches
+ * through the signed-in browser session, cover downloads, the audio classifier.
  *
- * This file is part of MPC-BE.
+ * Copyright (C) 2026 KH Radio authors.
+ * Derived from the KH Radio panel of the MPC-BE fork (MPC-BE, GPLv3).
  *
- * MPC-BE is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
- *
- * MPC-BE is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
+ * This program is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software
+ * Foundation, either version 3 of the License, or (at your option) any later version.
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ * PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with this
+ * program (COPYING.txt). If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "stdafx.h"
 #include "KHWebSession.h"
 #include "TextUtil.h"
-#include "AppData.h"
+#include "FileUtil.h"
+#include "Log.h"
 #include "KHInsider.h"
 
+#include <shlobj.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 
-#include <map>
-#include <regex>
-#include <string>
 #include <cmath>
+#include <functional>
 #include <mutex>
+#include <string>
 
-#include "JsonHelper.h"
-#include "rapidjson/writer.h"
-#include "rapidjson/stringbuffer.h"
-
+#pragma warning(push, 0)
+#pragma warning(disable: 4146 4244 4267 4456 4457 4701 4703)
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_NO_STDIO
 #include "minimp3/minimp3.h"
+#pragma warning(pop)
 
-#define KHINSIDER_HOST L"downloads.khinsider.com"
 #define KHINSIDER_BASE L"https://downloads.khinsider.com"
 
-// downloads.khinsider.com sits behind Cloudflare, which rejects requests
-// that do not look like they come from a real browser.
+// WinHTTP downloads (the audio prefix for the classifier, and covers when
+// curl-impersonate is missing) present a browser user agent.
 #define KH_USER_AGENT L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 #ifndef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
@@ -55,93 +50,128 @@
 #ifndef WINHTTP_PROTOCOL_FLAG_HTTP2
 #define WINHTTP_PROTOCOL_FLAG_HTTP2 0x1
 #endif
-#ifndef WINHTTP_OPTION_DISABLE_FEATURE
-#define WINHTTP_OPTION_DISABLE_FEATURE 63
-#endif
-#ifndef WINHTTP_DISABLE_COOKIES
-#define WINHTTP_DISABLE_COOKIES 0x00000001
-#endif
-#ifndef WINHTTP_DISABLE_KEEP_ALIVE
-#define WINHTTP_DISABLE_KEEP_ALIVE 0x00000002
-#endif
-#ifndef LOAD_LIBRARY_SEARCH_APPLICATION_DIR
-#define LOAD_LIBRARY_SEARCH_APPLICATION_DIR 0x00000200
-#endif
-#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
-#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
-#endif
 
 namespace KHInsider
 {
 	using urlData = std::vector<char>;
 
-	// Appends a timestamped line to %APPDATA%\KHRadio\khradio_debug.log.
-	static void KHLog(LPCWSTR fmt, ...)
+	namespace
 	{
-		static std::mutex s_logLock;
-		std::lock_guard<std::mutex> lock(s_logLock);
-		static const CStringW path = KHRadioData::AppDataDir() + L"khradio_debug.log";
-		static bool s_rotated = false;
-		if (!s_rotated) {
-			// keep the log bounded: start a new one when it passes 4 MB
-			s_rotated = true;
-			WIN32_FILE_ATTRIBUTE_DATA fa = {};
-			if (GetFileAttributesExW(path, GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > 4u * 1024 * 1024)) {
-				MoveFileExW(path, path + L".old", MOVEFILE_REPLACE_EXISTING);
+		std::atomic<bool> g_shuttingDown{false};
+
+		// Manual-reset event set at shutdown; retry back-offs wait on it.
+		HANDLE CancelEvent()
+		{
+			static const HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			return ev;
+		}
+
+		// Sleeps unless shutdown starts first; returns false if it did.
+		bool WaitOrCancel(DWORD ms)
+		{
+			const HANDLE ev = CancelEvent();
+			if (!ev) {
+				Sleep(ms);
+				return !g_shuttingDown;
+			}
+			return WaitForSingleObject(ev, ms) == WAIT_TIMEOUT;
+		}
+
+		SRWLOCK g_preferLock = SRWLOCK_INIT;
+		wchar_t g_preferExt[8] = {};
+
+		CStringW PreferredAudioFormat()
+		{
+			AcquireSRWLockShared(&g_preferLock);
+			CStringW ext = g_preferExt;
+			ReleaseSRWLockShared(&g_preferLock);
+			return ext;
+		}
+
+		SRWLOCK g_debugLock = SRWLOCK_INIT;
+		wchar_t g_debugDir[MAX_PATH * 2] = {};
+
+		void SaveDebugPage(LPCWSTR name, const std::string& html)
+		{
+			wchar_t path[MAX_PATH * 2 + 32] = {};
+			AcquireSRWLockShared(&g_debugLock);
+			if (g_debugDir[0]) {
+				swprintf_s(path, L"%s%s", g_debugDir, name);
+			}
+			ReleaseSRWLockShared(&g_debugLock);
+			if (path[0]) {
+				KHFile::WriteAtomic(path, html.data(), html.size());
 			}
 		}
+	}
 
-		CStringW msg;
-		va_list args;
-		va_start(args, fmt);
-		msg.FormatV(fmt, args);
-		va_end(args);
-
-		SYSTEMTIME st;
-		GetLocalTime(&st);
-		CStringW line;
-		line.Format(L"[%02u:%02u:%02u.%03u] %s\r\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg.GetString());
-		const CStringA utf8 = WStrToUTF8(line);
-
-		CFile f;
-		if (f.Open(path, CFile::modeWrite | CFile::modeCreate | CFile::modeNoTruncate | CFile::shareDenyNone)) {
-			f.SeekToEnd();
-			f.Write(utf8.GetString(), utf8.GetLength());
-			f.Close();
+	void SetDebugPageDir(const CStringW& dir)
+	{
+		AcquireSRWLockExclusive(&g_debugLock);
+		wcsncpy_s(g_debugDir, dir.GetString(), _TRUNCATE);
+		ReleaseSRWLockExclusive(&g_debugLock);
+		if (!dir.IsEmpty()) {
+			SHCreateDirectoryExW(nullptr, dir, nullptr);
 		}
+	}
+
+	void SetPreferredAudioFormat(const CStringW& ext)
+	{
+		CStringW e = ext;
+		e.Trim(L" .");
+		e.MakeLower();
+		if (e != L"ogg" && e != L"m4a" && e != L"mp3" && e != L"flac") {
+			e.Empty();
+		}
+		AcquireSRWLockExclusive(&g_preferLock);
+		wcsncpy_s(g_preferExt, e.GetString(), _TRUNCATE);
+		ReleaseSRWLockExclusive(&g_preferLock);
+	}
+
+	void BeginShutdown()
+	{
+		g_shuttingDown = true;
+		if (const HANDLE ev = CancelEvent()) {
+			SetEvent(ev);
+		}
+	}
+
+	bool IsShuttingDown()
+	{
+		return g_shuttingDown;
 	}
 
 	// ---- libcurl-impersonate: Cloudflare-resilient transport (optional) -------
 	//
-	// downloads.khinsider.com is fronted by Cloudflare, which fingerprints the
-	// TLS/HTTP2 handshake. WinHTTP's handshake is trusted on some networks but
-	// challenged on others (a 403 / "Just a moment..." JS page), which is why the
-	// same build streams fine on one PC and fails on another. curl-impersonate
-	// forges a real Chrome fingerprint and gets through where WinHTTP is blocked.
+	// downloads.khinsider.com and its cover CDN are fronted by Cloudflare, which
+	// fingerprints the TLS/HTTP2 handshake. WinHTTP's handshake is trusted on some
+	// networks but challenged on others (a 403 / "Just a moment..." page).
+	// curl-impersonate forges a real Chrome fingerprint and gets through.
 	//
-	// libcurl-impersonate.dll (+ zlib.dll) ships next to the exe, is loaded
-	// lazily, and is entirely optional: if it is missing or fails to load we fall
-	// back to the WinHTTP path, so trusted networks and DLL-less dev builds keep
-	// working unchanged.
+	// Pages themselves come through the signed-in WebView2 session (KHWebSession);
+	// this transport carries the plain downloads: album covers. The ranged audio
+	// prefix for the classifier stays on WinHTTP. libcurl-impersonate.dll (+ zlib.dll)
+	// ships next to the exe, is loaded lazily, and is optional: without it every
+	// download uses WinHTTP.
 
 	// curl option / info constants (ABI-stable; see curl/curl.h). Hand-declared
 	// so the build needs no curl include path.
-	enum {
+	enum : int {
 		KHCURLOPT_URL               = 10002,
 		KHCURLOPT_WRITEFUNCTION     = 20011,
 		KHCURLOPT_WRITEDATA         = 10001,
-		KHCURLOPT_POST              = 47,
-		KHCURLOPT_POSTFIELDS        = 10015,
-		KHCURLOPT_POSTFIELDSIZE     = 60,
 		KHCURLOPT_FOLLOWLOCATION    = 52,
-		KHCURLOPT_HTTPHEADER        = 10023,
 		KHCURLOPT_ACCEPT_ENCODING   = 10102,
 		KHCURLOPT_SSL_OPTIONS       = 216,
 		KHCURLOPT_TIMEOUT_MS        = 155,
 		KHCURLOPT_CONNECTTIMEOUT_MS = 156,
 		KHCURLOPT_NOSIGNAL          = 99,
 		KHCURLOPT_FRESH_CONNECT     = 74,
-		KHCURLINFO_EFFECTIVE_URL    = 1048577,
+		KHCURLOPT_NOPROGRESS        = 43,
+		KHCURLOPT_XFERINFOFUNCTION  = 20219,
+		KHCURLOPT_XFERINFODATA      = 10057,
+		KHCURLOPT_PROTOCOLS_STR     = 10318,
+		KHCURLOPT_REDIR_PROTOCOLS_STR = 10319,
 		KHCURLINFO_RESPONSE_CODE    = 2097154,
 		KHCURLSSLOPT_NATIVE_CA      = 16,
 		KHCURL_GLOBAL_DEFAULT       = 3,
@@ -153,7 +183,7 @@ namespace KHInsider
 #define KH_IMPERSONATE_TARGET "chrome146"
 	// Cloudflare challenges intermittently even with a perfect fingerprint, so
 	// retry a few times before giving up and falling back to WinHTTP.
-#define KH_CURL_ATTEMPTS 4
+#define KH_CURL_ATTEMPTS 3
 
 	typedef void   CURLh;
 	typedef int    (*pfn_curl_global_init)(long);
@@ -163,8 +193,6 @@ namespace KHInsider
 	typedef int    (*pfn_curl_easy_getinfo)(CURLh*, int, ...);
 	typedef void   (*pfn_curl_easy_cleanup)(CURLh*);
 	typedef int    (*pfn_curl_easy_impersonate)(CURLh*, const char*, int);
-	typedef struct curl_slist* (*pfn_curl_slist_append)(struct curl_slist*, const char*);
-	typedef void   (*pfn_curl_slist_free_all)(struct curl_slist*);
 
 	struct CurlApi {
 		HMODULE mod = nullptr;
@@ -176,11 +204,15 @@ namespace KHInsider
 		pfn_curl_easy_getinfo     easy_getinfo = nullptr;
 		pfn_curl_easy_cleanup     easy_cleanup = nullptr;
 		pfn_curl_easy_impersonate easy_impersonate = nullptr;
-		pfn_curl_slist_append     slist_append = nullptr;
-		pfn_curl_slist_free_all   slist_free_all = nullptr;
 	};
 	static CurlApi g_curl;
 	static std::once_flag g_curlOnce;
+
+	template <typename T>
+	static T CurlProc(HMODULE m, const char* name)
+	{
+		return reinterpret_cast<T>(reinterpret_cast<void*>(GetProcAddress(m, name)));
+	}
 
 	static void LoadCurlOnce()
 	{
@@ -189,29 +221,26 @@ namespace KHInsider
 		HMODULE m = LoadLibraryExW(L"libcurl-impersonate.dll", nullptr,
 								   LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 		if (!m) {
-			KHLog(L"curl: libcurl-impersonate.dll not loaded (err %lu) - using WinHTTP", GetLastError());
+			KHLog::Format(L"curl: libcurl-impersonate.dll not loaded (err %lu) - using WinHTTP", GetLastError());
 			return;
 		}
-		g_curl.global_init      = (pfn_curl_global_init)     GetProcAddress(m, "curl_global_init");
-		g_curl.easy_init        = (pfn_curl_easy_init)       GetProcAddress(m, "curl_easy_init");
-		g_curl.easy_setopt      = (pfn_curl_easy_setopt)     GetProcAddress(m, "curl_easy_setopt");
-		g_curl.easy_perform     = (pfn_curl_easy_perform)    GetProcAddress(m, "curl_easy_perform");
-		g_curl.easy_getinfo     = (pfn_curl_easy_getinfo)    GetProcAddress(m, "curl_easy_getinfo");
-		g_curl.easy_cleanup     = (pfn_curl_easy_cleanup)    GetProcAddress(m, "curl_easy_cleanup");
-		g_curl.easy_impersonate = (pfn_curl_easy_impersonate)GetProcAddress(m, "curl_easy_impersonate");
-		g_curl.slist_append     = (pfn_curl_slist_append)    GetProcAddress(m, "curl_slist_append");
-		g_curl.slist_free_all   = (pfn_curl_slist_free_all)  GetProcAddress(m, "curl_slist_free_all");
+		g_curl.global_init      = CurlProc<pfn_curl_global_init>(m, "curl_global_init");
+		g_curl.easy_init        = CurlProc<pfn_curl_easy_init>(m, "curl_easy_init");
+		g_curl.easy_setopt      = CurlProc<pfn_curl_easy_setopt>(m, "curl_easy_setopt");
+		g_curl.easy_perform     = CurlProc<pfn_curl_easy_perform>(m, "curl_easy_perform");
+		g_curl.easy_getinfo     = CurlProc<pfn_curl_easy_getinfo>(m, "curl_easy_getinfo");
+		g_curl.easy_cleanup     = CurlProc<pfn_curl_easy_cleanup>(m, "curl_easy_cleanup");
+		g_curl.easy_impersonate = CurlProc<pfn_curl_easy_impersonate>(m, "curl_easy_impersonate");
 
 		if (g_curl.global_init && g_curl.easy_init && g_curl.easy_setopt && g_curl.easy_perform
-				&& g_curl.easy_getinfo && g_curl.easy_cleanup && g_curl.easy_impersonate
-				&& g_curl.slist_append && g_curl.slist_free_all) {
+				&& g_curl.easy_getinfo && g_curl.easy_cleanup && g_curl.easy_impersonate) {
 			g_curl.global_init(KHCURL_GLOBAL_DEFAULT);
 			g_curl.mod = m;
 			g_curl.ok = true;
-			KHLog(L"curl: libcurl-impersonate loaded (target %S)", KH_IMPERSONATE_TARGET);
+			KHLog::Format(L"curl: libcurl-impersonate loaded (target %S)", KH_IMPERSONATE_TARGET);
 		} else {
 			FreeLibrary(m);
-			KHLog(L"curl: libcurl-impersonate.dll missing expected exports - using WinHTTP");
+			KHLog::Line(L"curl: libcurl-impersonate.dll missing expected exports - using WinHTTP");
 		}
 	}
 
@@ -221,111 +250,136 @@ namespace KHInsider
 		return g_curl.ok;
 	}
 
+	// Where a download goes: memory (covers, the classifier's prefix) or an open
+	// file (track audio for the cache). 'cancelled' (optional) ends it early.
+	struct Sink {
+		urlData* data = nullptr;
+		HANDLE file = INVALID_HANDLE_VALUE;
+		size_t maxBytes = 0;      // 0 = no limit
+		bool truncateOk = false;  // stop quietly at maxBytes instead of failing
+		size_t size = 0;
+		bool overflow = false;
+		bool truncated = false;
+		bool writeFailed = false;
+		const std::function<bool()>* cancelled = nullptr;
+
+		bool Cancelled() const { return g_shuttingDown || (cancelled && *cancelled && (*cancelled)()); }
+
+		bool Reset()
+		{
+			size = 0;
+			overflow = truncated = writeFailed = false;
+			if (data) {
+				data->clear();
+			}
+			if (file != INVALID_HANDLE_VALUE) {
+				LARGE_INTEGER zero = {};
+				return SetFilePointerEx(file, zero, nullptr, FILE_BEGIN) && SetEndOfFile(file);
+			}
+			return true;
+		}
+
+		// false ends the transfer: over the cap, a write error, or the cap reached with truncateOk
+		bool Put(const char* p, size_t n)
+		{
+			if (maxBytes && size + n > maxBytes) {
+				if (!truncateOk) {
+					overflow = true;
+					return false;
+				}
+				n = maxBytes - size;
+				truncated = true;
+			}
+			if (file != INVALID_HANDLE_VALUE) {
+				DWORD written = 0;
+				if (n && (!WriteFile(file, p, static_cast<DWORD>(n), &written, nullptr) || written != n)) {
+					writeFailed = true;
+					return false;
+				}
+			} else if (data) {
+				data->insert(data->end(), p, p + n);
+			}
+			size += n;
+			return !truncated;
+		}
+
+		void Drop()
+		{
+			if (data) {
+				data->clear();
+			}
+		}
+	};
+
 	static size_t CurlWriteCb(char* ptr, size_t size, size_t nmemb, void* ud)
 	{
 		const size_t n = size * nmemb;
-		auto* data = static_cast<urlData*>(ud);
-		data->insert(data->end(), ptr, ptr + n);
-		return n;
+		return static_cast<Sink*>(ud)->Put(ptr, n) ? n : 0; // 0 aborts the transfer
 	}
 
-	// Single fetch over libcurl-impersonate. Mirrors URLRequestWinHTTP's contract:
-	// fills pData (NUL-terminated), optional final URL + HTTP status, returns true
-	// on a < 400 response with a body. Used for the Cloudflare-fronted khinsider
-	// requests; the CDN audio/cover downloads stay on WinHTTP.
-	static bool URLRequestCurl(LPCWSTR verb, const CStringW& url, const CStringA& body, urlData& pData,
-							   CStringW* pFinalUrl, DWORD* pHttpStatus)
+	static int CurlProgressCb(void* ud, long long, long long, long long, long long)
 	{
-		pData.clear();
-		if (pFinalUrl) {
-			pFinalUrl->Empty();
-		}
-		if (pHttpStatus) {
-			*pHttpStatus = 0;
-		}
+		return static_cast<Sink*>(ud)->Cancelled() ? 1 : 0; // non-zero aborts the transfer
+	}
 
-		if (!CurlAvailable()) {
+	// Single GET over libcurl-impersonate into 'sink'. True on a < 400 response
+	// with a non-empty body within the sink's cap.
+	static bool CurlGet(const CStringW& url, Sink& sink, long timeoutMs, long* pStatus)
+	{
+		*pStatus = 0;
+		if (!sink.Reset()) {
 			return false;
 		}
-
 		CURLh* h = g_curl.easy_init();
 		if (!h) {
 			return false;
 		}
 
 		const CStringA urlA = WStrToUTF8(url);
-		struct curl_slist* hdrs = nullptr;
 
 		g_curl.easy_setopt(h, KHCURLOPT_URL, urlA.GetString());
+		g_curl.easy_setopt(h, KHCURLOPT_PROTOCOLS_STR, "http,https");
+		g_curl.easy_setopt(h, KHCURLOPT_REDIR_PROTOCOLS_STR, "http,https");
 		g_curl.easy_setopt(h, KHCURLOPT_WRITEFUNCTION, &CurlWriteCb);
-		g_curl.easy_setopt(h, KHCURLOPT_WRITEDATA, &pData);
+		g_curl.easy_setopt(h, KHCURLOPT_WRITEDATA, &sink);
 		g_curl.easy_setopt(h, KHCURLOPT_FOLLOWLOCATION, 1L);
 		g_curl.easy_setopt(h, KHCURLOPT_ACCEPT_ENCODING, "");                       // advertise + auto-decompress
-		g_curl.easy_setopt(h, KHCURLOPT_SSL_OPTIONS, (long)KHCURLSSLOPT_NATIVE_CA); // verify against the Windows cert store
+		g_curl.easy_setopt(h, KHCURLOPT_SSL_OPTIONS, static_cast<long>(KHCURLSSLOPT_NATIVE_CA)); // Windows cert store
 		g_curl.easy_setopt(h, KHCURLOPT_NOSIGNAL, 1L);
 		g_curl.easy_setopt(h, KHCURLOPT_FRESH_CONNECT, 1L);                         // never reuse a possibly-challenged connection
 		g_curl.easy_setopt(h, KHCURLOPT_CONNECTTIMEOUT_MS, 15000L);
-		g_curl.easy_setopt(h, KHCURLOPT_TIMEOUT_MS, 30000L);
+		g_curl.easy_setopt(h, KHCURLOPT_TIMEOUT_MS, timeoutMs);
+		g_curl.easy_setopt(h, KHCURLOPT_NOPROGRESS, 0L);
+		g_curl.easy_setopt(h, KHCURLOPT_XFERINFOFUNCTION, &CurlProgressCb);
+		g_curl.easy_setopt(h, KHCURLOPT_XFERINFODATA, &sink);
 
 		// Forge a current Chrome TLS/HTTP2 fingerprint + matching default headers.
 		g_curl.easy_impersonate(h, KH_IMPERSONATE_TARGET, 1);
 
-		if (!body.IsEmpty()) {
-			g_curl.easy_setopt(h, KHCURLOPT_POST, 1L);
-			g_curl.easy_setopt(h, KHCURLOPT_POSTFIELDSIZE, (long)body.GetLength());
-			g_curl.easy_setopt(h, KHCURLOPT_POSTFIELDS, body.GetString());
-			hdrs = g_curl.slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
-		}
-		if (hdrs) {
-			g_curl.easy_setopt(h, KHCURLOPT_HTTPHEADER, hdrs);
-		}
-
 		const int rc = g_curl.easy_perform(h);
-
 		long status = 0;
 		g_curl.easy_getinfo(h, KHCURLINFO_RESPONSE_CODE, &status);
-		if (pHttpStatus) {
-			*pHttpStatus = (DWORD)status;
-		}
-		if (pFinalUrl) {
-			char* eff = nullptr;
-			if (g_curl.easy_getinfo(h, KHCURLINFO_EFFECTIVE_URL, &eff) == 0 && eff) {
-				*pFinalUrl = UTF8ToWStr(eff);
-			}
-		}
-
-		if (hdrs) {
-			g_curl.slist_free_all(hdrs);
-		}
 		g_curl.easy_cleanup(h);
+		*pStatus = status;
 
-		KHLog(L"curl %s %s -> rc=%d status=%ld, %u bytes", verb, url.GetString(), rc, status,
-			  static_cast<unsigned>(pData.size()));
+		KHLog::Format(L"curl GET %s -> rc=%d status=%ld, %llu bytes%s%s", url.GetString(), rc, status,
+			static_cast<unsigned long long>(sink.size), sink.overflow ? L" (over the size cap, dropped)" : L"",
+			sink.writeFailed ? L" (could not write the file)" : L"");
 
-		if (rc != 0 || status >= 400) {
-			pData.clear();
+		if (rc != 0 || status >= 400 || sink.overflow || sink.writeFailed) {
+			sink.Drop();
 			return false;
 		}
-		if (!pData.empty()) {
-			pData.emplace_back('\0');
-		}
-		return !pData.empty();
+		return sink.size > 0;
 	}
 
-	// GET or POST (form-urlencoded when 'body' is non-empty) with browser-like
-	// headers over WinHTTP. Cloudflare on downloads.khinsider.com only accepts
-	// browser user-agents speaking HTTP/2, which WinHTTP supports (WinInet's
-	// HTTP/2 option does not take effect and gets a 403). Redirects are
-	// followed; 'pFinalUrl' (optional) receives the URL we actually ended up on.
-	static bool URLRequestWinHTTP(LPCWSTR verb, const CStringW& url, const CStringA& body, urlData& pData, CStringW* pFinalUrl = nullptr,
-						   LPCWSTR extraHeaders = nullptr, size_t maxBytes = 0, DWORD* pHttpStatus = nullptr)
+	// GET over WinHTTP with browser-like headers, bounded timeouts and an overall
+	// deadline. 'range' (optional) asks for part of the file; with the sink's
+	// truncateOk reading stops quietly at its cap, otherwise a bigger body fails.
+	static bool WinHttpGet(const CStringW& url, Sink& sink, LPCWSTR range, ULONGLONG deadlineMs)
 	{
-		pData.clear();
-		if (pFinalUrl) {
-			pFinalUrl->Empty();
-		}
-		if (pHttpStatus) {
-			*pHttpStatus = 0;
+		if (sink.Cancelled() || !sink.Reset()) {
+			return false;
 		}
 
 		WCHAR host[256] = {};
@@ -336,75 +390,59 @@ namespace KHInsider
 		uc.lpszUrlPath = path;
 		uc.dwUrlPathLength = static_cast<DWORD>(std::size(path));
 		if (!WinHttpCrackUrl(url, 0, 0, &uc)) {
-			KHLog(L"WinHttpCrackUrl failed for %s (err %lu)", url.GetString(), GetLastError());
+			KHLog::Format(L"WinHttpCrackUrl failed for %s (err %lu)", url.GetString(), GetLastError());
+			return false;
+		}
+		if (uc.nScheme != INTERNET_SCHEME_HTTPS && uc.nScheme != INTERNET_SCHEME_HTTP) {
 			return false;
 		}
 
+		const ULONGLONG started = GetTickCount64();
 		DWORD dwStatus = 0;
+		bool timedOut = false;
 
 		if (auto hSession = WinHttpOpen(KH_USER_AGENT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)) {
+			// resolve, connect, send, receive: no single step may hang the worker
+			WinHttpSetTimeouts(hSession, 10000, 10000, 15000, 20000);
 			DWORD dwProto = WINHTTP_PROTOCOL_FLAG_HTTP2;
 			WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &dwProto, sizeof(dwProto));
 
 			if (auto hConnect = WinHttpConnect(hSession, host, uc.nPort, 0)) {
 				const DWORD dwFlags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-				if (auto hRequest = WinHttpOpenRequest(hConnect, verb, path, nullptr,
-													   KHINSIDER_BASE L"/",
-													   WINHTTP_DEFAULT_ACCEPT_TYPES, dwFlags)) {
-
-					// Don't carry cookies or pooled connections between requests:
-					// over the app's lifetime the server otherwise pins the
-					// "random" album to the session and keeps returning the same one.
+				if (auto hRequest = WinHttpOpenRequest(hConnect, L"GET", path, nullptr,
+													   KHINSIDER_BASE L"/", WINHTTP_DEFAULT_ACCEPT_TYPES, dwFlags)) {
+					// Don't carry cookies or pooled connections between requests.
 					DWORD dwDisable = WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_KEEP_ALIVE;
 					WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &dwDisable, sizeof(dwDisable));
 
-					CStringW headers =
-						L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-						L"Accept-Language: en-US,en;q=0.9\r\n";
-					if (!body.IsEmpty()) {
-						headers += L"Content-Type: application/x-www-form-urlencoded\r\n";
-					}
-					if (extraHeaders) {
-						headers += extraHeaders;
+					CStringW headers = L"Accept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n";
+					if (range) {
+						headers += range;
 					}
 
-					CStringA requestData(body);
-					if (WinHttpSendRequest(hRequest, headers, static_cast<DWORD>(-1),
-										   body.IsEmpty() ? WINHTTP_NO_REQUEST_DATA : reinterpret_cast<LPVOID>(requestData.GetBuffer()),
-										   requestData.GetLength(), requestData.GetLength(), 0)
+					if (WinHttpSendRequest(hRequest, headers, static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
 							&& WinHttpReceiveResponse(hRequest, nullptr)) {
-
 						DWORD dwLen = sizeof(dwStatus);
 						WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
 											WINHTTP_HEADER_NAME_BY_INDEX, &dwStatus, &dwLen, WINHTTP_NO_HEADER_INDEX);
 
-						std::vector<char> tmp(16 * 1024);
-						for (;;) {
+						std::vector<char> tmp(64 * 1024);
+						while (dwStatus < 400) {
+							if (sink.Cancelled() || GetTickCount64() - started > deadlineMs) {
+								timedOut = true;
+								break;
+							}
 							DWORD dwSizeRead = 0;
-							if (!WinHttpReadData(hRequest, reinterpret_cast<LPVOID>(tmp.data()), static_cast<DWORD>(tmp.size()), &dwSizeRead) || !dwSizeRead) {
+							if (!WinHttpReadData(hRequest, tmp.data(), static_cast<DWORD>(tmp.size()), &dwSizeRead) || !dwSizeRead) {
 								break;
 							}
-							pData.insert(pData.end(), tmp.begin(), tmp.begin() + dwSizeRead);
-							if (maxBytes && pData.size() >= maxBytes) {
+							if (!sink.Put(tmp.data(), dwSizeRead)) {
 								break;
-							}
-						}
-
-						if (!pData.empty()) {
-							pData.emplace_back('\0');
-
-							if (pFinalUrl) {
-								WCHAR urlBuf[2048] = {};
-								DWORD urlLen = sizeof(urlBuf);
-								if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, urlBuf, &urlLen)) {
-									*pFinalUrl = urlBuf;
-								}
 							}
 						}
 					} else {
-						KHLog(L"%s %s: send/receive failed (err %lu)", verb, url.GetString(), GetLastError());
+						KHLog::Format(L"GET %s: send/receive failed (err %lu)", url.GetString(), GetLastError());
 					}
-
 					WinHttpCloseHandle(hRequest);
 				}
 				WinHttpCloseHandle(hConnect);
@@ -412,329 +450,105 @@ namespace KHInsider
 			WinHttpCloseHandle(hSession);
 		}
 
-		if (pHttpStatus) {
-			*pHttpStatus = dwStatus;
-		}
+		KHLog::Format(L"GET %s -> status %lu, %llu bytes%s%s%s", url.GetString(), dwStatus, static_cast<unsigned long long>(sink.size),
+			sink.overflow ? L" (over the size cap, dropped)" : L"", sink.writeFailed ? L" (could not write the file)" : L"",
+			timedOut ? L" (gave up: deadline, exit or cancelled)" : L"");
 
-		KHLog(L"%s %s -> status %lu, %u bytes%s%s", verb, url.GetString(), dwStatus,
-			  static_cast<unsigned>(pData.size()),
-			  pFinalUrl && !pFinalUrl->IsEmpty() ? L", final: " : L"",
-			  pFinalUrl ? pFinalUrl->GetString() : L"");
-
-		if (dwStatus >= 400) {
-			pData.clear();
+		if (dwStatus >= 400 || dwStatus == 0 || sink.overflow || sink.writeFailed || timedOut) {
+			sink.Drop();
 			return false;
 		}
-
-		return !pData.empty();
+		return sink.size > 0;
 	}
 
-	// Transport dispatcher. Cloudflare-fronted khinsider.com requests go through
-	// curl-impersonate, retried a few times because Cloudflare challenges even a
-	// real browser intermittently; if every attempt fails (or the DLL isn't
-	// present) we fall back to WinHTTP. Everything else - the CDN audio/cover
-	// hosts, and the Range-limited audio prefix fetch - stays on WinHTTP.
-	static bool URLRequest(LPCWSTR verb, const CStringW& url, const CStringA& body, urlData& pData, CStringW* pFinalUrl = nullptr,
-						   LPCWSTR extraHeaders = nullptr, size_t maxBytes = 0, DWORD* pHttpStatus = nullptr)
+	// Plain downloads. Cloudflare-fronted hosts go through curl-impersonate first
+	// (retried, since Cloudflare challenges even a real browser now and then),
+	// falling back to WinHTTP; ranged requests always use WinHTTP.
+	static bool HttpGet(const CStringW& url, Sink& sink, LPCWSTR range = nullptr, long curlTimeoutMs = 30000, ULONGLONG winHttpDeadlineMs = 45000)
 	{
-		// Cloudflare-fronted hosts: the main site and the vgmtreasurechest CDN
-		// (album covers). Route their plain GET/POSTs through curl-impersonate; the
-		// audio-prefix Range fetch (extraHeaders/maxBytes set) stays on WinHTTP.
-		const bool cfHost = (url.Find(KHINSIDER_HOST) >= 0) || (url.Find(L"vgmtreasurechest.com") >= 0);
-		if (cfHost && !extraHeaders && maxBytes == 0 && CurlAvailable()) {
-			for (int attempt = 1; attempt <= KH_CURL_ATTEMPTS; ++attempt) {
-				DWORD st = 0;
-				if (URLRequestCurl(verb, url, body, pData, pFinalUrl, &st)) {
-					if (pHttpStatus) {
-						*pHttpStatus = st;
-					}
+		if (!range && !sink.truncateOk && CurlAvailable()) {
+			for (int attempt = 1; attempt <= KH_CURL_ATTEMPTS && !sink.Cancelled(); ++attempt) {
+				long status = 0;
+				if (CurlGet(url, sink, curlTimeoutMs, &status)) {
 					return true;
 				}
-				if (attempt < KH_CURL_ATTEMPTS) {
-					KHLog(L"curl: attempt %d failed (status %lu) - retrying", attempt, st);
-					Sleep(400 * attempt);
-				} else {
-					KHLog(L"curl: all %d attempts failed (status %lu) - falling back to WinHTTP", KH_CURL_ATTEMPTS, st);
+				if (status == 404 || sink.overflow || sink.writeFailed) {
+					return false; // retrying won't help
+				}
+				if (attempt < KH_CURL_ATTEMPTS && !WaitOrCancel(static_cast<DWORD>(400 * attempt))) {
+					return false;
 				}
 			}
+			if (sink.Cancelled()) {
+				return false;
+			}
+			KHLog::Line(L"curl: all attempts failed - falling back to WinHTTP");
 		}
-		return URLRequestWinHTTP(verb, url, body, pData, pFinalUrl, extraHeaders, maxBytes, pHttpStatus);
+		return WinHttpGet(url, sink, range, winHttpDeadlineMs);
 	}
 
-	void DebugLog(const CStringW& msg)
+	static bool HttpGetBytes(const CStringW& url, urlData& data, size_t maxBytes, bool truncateOk = false, LPCWSTR range = nullptr)
 	{
-		KHLog(L"%s", msg.GetString());
+		Sink sink;
+		sink.data = &data;
+		sink.maxBytes = maxBytes;
+		sink.truncateOk = truncateOk;
+		return HttpGet(url, sink, range);
 	}
 
-	CStringW DecodeHtmlEntities(CStringW str)
+	static bool FetchPage(const CStringW& url, const CStringA& body, std::string& html, CStringW* finalUrl, FetchStatus* status)
 	{
-		str.Replace(L"&quot;", L"\"");
-		str.Replace(L"&#34;", L"\"");
-		str.Replace(L"&#39;", L"'");
-		str.Replace(L"&apos;", L"'");
-		str.Replace(L"&lt;", L"<");
-		str.Replace(L"&gt;", L">");
-		str.Replace(L"&nbsp;", L" ");
-
-		// numeric entities: &#1234; and &#x12AB;
-		int pos = 0;
-		while ((pos = str.Find(L"&#", pos)) != -1) {
-			const int semi = str.Find(L';', pos);
-			if (semi == -1 || semi - pos > 9) {
-				pos += 2;
-				continue;
-			}
-			const CStringW num = str.Mid(pos + 2, semi - pos - 2);
-			WCHAR* endPtr = nullptr;
-			long code = 0;
-			if (!num.IsEmpty() && (num[0] == L'x' || num[0] == L'X')) {
-				code = wcstol(num.Mid(1), &endPtr, 16);
-			} else {
-				code = wcstol(num, &endPtr, 10);
-			}
-			if (code > 0 && code < 0x10000 && endPtr && *endPtr == 0) {
-				str.Delete(pos, semi - pos + 1);
-				str.Insert(pos, static_cast<WCHAR>(code));
-				pos++;
-			} else {
-				pos += 2;
-			}
-		}
-
-		str.Replace(L"&amp;", L"&"); // last, so "&amp;quot;" doesn't double-decode
-		return str;
-	}
-
-	static CStringW StripTags(const CStringW& str)
-	{
-		CStringW out;
-		bool inTag = false;
-		for (int i = 0; i < str.GetLength(); i++) {
-			const WCHAR ch = str[i];
-			if (ch == L'<') {
-				inTag = true;
-			} else if (ch == L'>') {
-				inTag = false;
-			} else if (!inTag) {
-				out += ch;
-			}
-		}
-		return out;
-	}
-
-	static CStringW Trimmed(CStringW str)
-	{
-		str.Trim(L" \t\r\n");
-		return str;
-	}
-
-	static bool ParseAlbumPage(const urlData& data, const CStringW& pageUrl, Album& album)
-	{
-		album.url = pageUrl;
-		album.title.Empty();
-		album.tracks.clear();
-
-		const std::string html(data.data());
-
-		// Album title: first <h2> inside the page content.
-		size_t contentPos = html.find("id=\"pageContent\"");
-		if (contentPos == std::string::npos) {
-			contentPos = 0;
-		}
-		const size_t h2Start = html.find("<h2>", contentPos);
-		if (h2Start != std::string::npos) {
-			const size_t h2End = html.find("</h2>", h2Start);
-			if (h2End != std::string::npos) {
-				const std::string titleHtml = html.substr(h2Start + 4, h2End - h2Start - 4);
-				album.title = Trimmed(DecodeHtmlEntities(StripTags(UTF8ToWStr(titleHtml.c_str()))));
-			}
-		}
-
-		// Track list: links inside the songlist table, skipping the
-		// header/footer rows (their cells may hold sort/download links).
-		size_t listStart = html.find("id=\"songlist\"");
-		size_t listEnd;
-		bool bFallback = false;
-		if (listStart != std::string::npos) {
-			const size_t headerPos = html.find("id=\"songlist_header\"", listStart);
-			if (headerPos != std::string::npos) {
-				const size_t headerEnd = html.find("</tr>", headerPos);
-				if (headerEnd != std::string::npos) {
-					listStart = headerEnd;
-				}
-			}
-			listEnd = html.find("id=\"songlist_footer\"", listStart);
-			if (listEnd == std::string::npos) {
-				listEnd = html.find("</table>", listStart);
-			}
-			if (listEnd == std::string::npos) {
-				listEnd = html.size();
-			}
-		} else {
-			// The songlist marker is gone - the site may have been redesigned.
-			// Scan the whole page, but only accept links under THIS album's
-			// path so we don't pick up sidebar links to other albums.
-			bFallback = true;
-			listStart = 0;
-			listEnd = html.size();
-			KHLog(L"songlist marker not found - scanning whole page (site layout may have changed)");
-		}
-		const std::string songlist = html.substr(listStart, listEnd - listStart);
-
-		// album path prefix, e.g. "/game-soundtracks/album/<slug>/", for the fallback
-		std::string albumPrefix;
-		{
-			const CStringA puA = WStrToUTF8(pageUrl);
-			const std::string pu(puA.GetString());
-			const size_t ap = pu.find("/game-soundtracks/album/");
-			if (ap != std::string::npos) {
-				albumPrefix = pu.substr(ap) + "/";
-			}
-		}
-
-		static const std::regex reLink("<a\\s+href=\"(/game-soundtracks/album/[^\"]+)\"[^>]*>([^<]+)</a>", std::regex::icase);
-		static const std::regex reDuration("^\\d+:\\d{2}(:\\d{2})?$");
-		static const std::regex reSize("^[\\d.,]+\\s*[KMG]B$", std::regex::icase);
-
-		std::map<std::string, bool> seen;
-		std::string lastHref; // href of the most recently added track (for its duration cell)
-
-		for (auto it = std::sregex_iterator(songlist.begin(), songlist.end(), reLink); it != std::sregex_iterator(); ++it) {
-			const std::string href = (*it)[1].str();
-			std::string text = (*it)[2].str();
-
-			// in fallback mode keep only this album's own track links
-			if (bFallback && (albumPrefix.empty() || href.compare(0, albumPrefix.size(), albumPrefix) != 0)) {
-				continue;
-			}
-
-			CStringW name = Trimmed(DecodeHtmlEntities(UTF8ToWStr(text.c_str())));
-			if (name.IsEmpty()) {
-				continue;
-			}
-			const std::string nameUtf8(WStrToUTF8(name));
-			if (std::regex_match(nameUtf8, reDuration)) {
-				// each row has a duration cell linking to the same track page;
-				// record it against the track we just added
-				if (!album.tracks.empty() && href == lastHref && album.tracks.back().durationSec == 0) {
-					int a = 0, b = 0, c = 0;
-					const int parts = sscanf_s(nameUtf8.c_str(), "%d:%d:%d", &a, &b, &c);
-					album.tracks.back().durationSec = (parts == 3) ? (a * 3600 + b * 60 + c)
-													: (parts == 2) ? (a * 60 + b) : 0;
-				}
-				continue;
-			}
-			if (std::regex_match(nameUtf8, reSize)) {
-				continue;
-			}
-			if (seen.find(href) != seen.end()) {
-				continue;
-			}
-			seen[href] = true;
-
-			Track track;
-			track.name = name;
-			track.pageUrl = KHINSIDER_BASE + DecodeHtmlEntities(UTF8ToWStr(href.c_str()));
-			album.tracks.emplace_back(track);
-			lastHref = href;
-		}
-
-		if (album.title.IsEmpty() && !pageUrl.IsEmpty()) {
-			// fall back to the URL slug
-			const int slash = pageUrl.ReverseFind(L'/');
-			if (slash != -1) {
-				CStringW slug = pageUrl.Mid(slash + 1);
-				slug.Replace(L'-', L' ');
-				album.title = slug;
-			}
-		}
-
-		// Album cover candidates. Each <div class="albumImage"> block holds a full-
-		// size <a href="..."> (a high-res scan - sharp as the now-playing art) and a
-		// small <img src="...thumbs/..."> (only ~117 px - looks tiny when displayed).
-		// Prefer each block's full image, with the thumbnails as fallbacks; the worker
-		// tries them in order until one downloads. Cover downloads now go through
-		// curl-impersonate, so the larger full image is reliable - the thumbnail was
-		// only a workaround for the old, sometimes-blocked WinHTTP path.
-		static const std::regex reImgSrc("<img[^>]*\\ssrc=\"(https?://[^\"]+\\.(?:jpg|jpeg|png|gif|webp))\"", std::regex::icase);
-		static const std::regex reImgHref("href=\"(https?://[^\"]+\\.(?:jpg|jpeg|png|gif|webp))\"", std::regex::icase);
-		std::vector<CStringW> thumbs, fulls;
-		for (size_t imgPos = html.find("class=\"albumImage\""); imgPos != std::string::npos;
-				imgPos = html.find("class=\"albumImage\"", imgPos + 1)) {
-			const std::string imgBlock = html.substr(imgPos, 600);
-			std::smatch m;
-			if (std::regex_search(imgBlock, m, reImgSrc)) {
-				thumbs.push_back(DecodeHtmlEntities(UTF8ToWStr(m[1].str().c_str())));
-			}
-			if (std::regex_search(imgBlock, m, reImgHref)) {
-				fulls.push_back(DecodeHtmlEntities(UTF8ToWStr(m[1].str().c_str())));
-			}
-		}
-		for (const auto& u : fulls)  { album.coverUrls.push_back(u); }
-		for (const auto& u : thumbs) { album.coverUrls.push_back(u); }
-
-		// album platforms: the "Platforms: <a>Saturn</a>, <a>Arcade</a><br>" line in
-		// the page header (always "Platforms:" even for one). Surfaced in the UI so
-		// the console filter's effect is visible - albums are frequently tagged with
-		// several consoles. Distinct from the sidebar "Platforms" nav (it has no colon).
-		const size_t platPos = html.find("Platforms:");
-		if (platPos != std::string::npos) {
-			const size_t brPos = html.find("<br", platPos);
-			const std::string platLine = html.substr(platPos, brPos == std::string::npos ? 600 : brPos - platPos);
-			static const std::regex rePlatName(">([^<]+)</a>");
-			for (auto it = std::sregex_iterator(platLine.begin(), platLine.end(), rePlatName); it != std::sregex_iterator(); ++it) {
-				const CStringW n = Trimmed(DecodeHtmlEntities(UTF8ToWStr((*it)[1].str().c_str())));
-				if (!n.IsEmpty()) {
-					if (!album.platforms.IsEmpty()) {
-						album.platforms += L", ";
-					}
-					album.platforms += n;
-				}
-			}
-		}
-
-		const CStringW coverInfo = album.coverUrls.empty() ? CStringW(L"(none)") : album.coverUrls[0];
-		KHLog(L"parsed album: '%s', %u tracks, platforms [%s], %u cover candidate(s), first=%s",
-			  album.title.GetString(), static_cast<unsigned>(album.tracks.size()),
-			  album.platforms.IsEmpty() ? L"(none)" : album.platforms.GetString(),
-			  static_cast<unsigned>(album.coverUrls.size()), coverInfo.GetString());
-
-		return !album.tracks.empty();
-	}
-
-	CStringA BuildRandomAlbumForm(const std::vector<int>& types, const std::vector<int>& years, const std::vector<int>& platforms)
-	{
-		CStringA body;
-		for (const auto v : types) {
-			body.AppendFormat("type%%5B%%5D=%d&", v);
-		}
-		for (const auto v : years) {
-			body.AppendFormat("year%%5B%%5D=%d&", v);
-		}
-		for (const auto v : platforms) {
-			body.AppendFormat("category%%5B%%5D=%d&", v);
-		}
-		body += "randomAdvanced=Show+Me+A+Random+Album";
-		return body;
-	}
-
-	static bool FetchPage(const CStringW& url, const CStringA& body, urlData& data,
-		CStringW* finalUrl, FetchStatus* status)
-	{
-		auto response = KHWebSession::Request(url.GetString(), body.GetString());
 		FetchStatus result = FetchStatus::NetworkError;
-		switch (response.status) {
-			case KHWebSession::Status::Ready: result = FetchStatus::Success; break;
-			case KHWebSession::Status::LoginRequired: result = FetchStatus::LoginRequired; break;
-			case KHWebSession::Status::Blocked: result = FetchStatus::Blocked; break;
-			case KHWebSession::Status::Unavailable: result = FetchStatus::BrowserUnavailable; break;
-			case KHWebSession::Status::LayoutChanged: result = FetchStatus::LayoutChanged; break;
+		if (!g_shuttingDown) {
+			auto response = KHWebSession::Request(url.GetString(), body.GetString());
+			switch (response.status) {
+				case KHWebSession::Status::Ready: result = FetchStatus::Success; break;
+				case KHWebSession::Status::LoginRequired: result = FetchStatus::LoginRequired; break;
+				case KHWebSession::Status::Blocked: result = FetchStatus::Blocked; break;
+				case KHWebSession::Status::Unavailable: result = FetchStatus::BrowserUnavailable; break;
+				case KHWebSession::Status::LayoutChanged: result = FetchStatus::LayoutChanged; break;
+				default: result = FetchStatus::NetworkError; break;
+			}
+			if (result == FetchStatus::Success) {
+				html = std::move(response.html);
+				if (finalUrl) {
+					*finalUrl = response.url.c_str();
+				}
+			} else {
+				KHLog::Format(L"page %s -> not fetched (session status %d, HTTP %u)", url.GetString(),
+					static_cast<int>(response.status), response.httpStatus);
+			}
 		}
-		if (status) { *status = result; }
-		if (result != FetchStatus::Success) { return false; }
-		data.assign(response.html.begin(), response.html.end());
-		data.push_back(0);
-		if (finalUrl) { *finalUrl = response.url.c_str(); }
+		if (status) {
+			*status = result;
+		}
+		return result == FetchStatus::Success;
+	}
+
+	static bool ParseAlbumChecked(const std::string& html, const CStringW& url, Album& album, FetchStatus* pStatus)
+	{
+		SaveDebugPage(L"album.html", html);
+		bool usedFallback = false;
+		const bool ok = ParseAlbumPage(html, url, album, &usedFallback);
+		if (usedFallback) {
+			KHLog::Format(L"album page %s: no songlist table - scanned the whole page (the site's page format may have changed)", url.GetString());
+		}
+		if (!ok) {
+			KHLog::Format(L"album page %s: no track list found in %u bytes - KHInsider's page format appears to have changed",
+				url.GetString(), static_cast<unsigned>(html.size()));
+			if (pStatus) {
+				*pStatus = FetchStatus::LayoutChanged;
+			}
+			return false;
+		}
+		const CStringW coverInfo = album.coverUrls.empty() ? CStringW(L"(none)") : album.coverUrls[0];
+		KHLog::Format(L"parsed album: '%s', %u tracks, platforms [%s], %u cover candidate(s), first=%s",
+			album.title.GetString(), static_cast<unsigned>(album.tracks.size()),
+			album.platforms.IsEmpty() ? L"(none)" : album.platforms.GetString(),
+			static_cast<unsigned>(album.coverUrls.size()), coverInfo.GetString());
+		if (pStatus) {
+			*pStatus = FetchStatus::Success;
+		}
 		return true;
 	}
 
@@ -742,14 +556,14 @@ namespace KHInsider
 	{
 		// Unique query each call so no cache/edge layer can serve a stale
 		// (always-identical) "random" album back to us.
-		static volatile LONG s_nonce = 0;
-		const LONG nonce = ::InterlockedIncrement(&s_nonce);
+		static std::atomic<unsigned> s_nonce{0};
+		const unsigned nonce = ++s_nonce;
 		CStringW url;
-		url.Format(L"%s/random-album-advanced?_=%lu%ld", KHINSIDER_BASE, ::GetTickCount(), nonce);
+		url.Format(L"%s/random-album-advanced?_=%llu%u", KHINSIDER_BASE, GetTickCount64(), nonce);
 
-		urlData data;
+		std::string html;
 		CStringW finalUrl;
-		if (!FetchPage(url, formBody, data, &finalUrl, pStatus)) {
+		if (!FetchPage(url, formBody, html, &finalUrl, pStatus)) {
 			return false;
 		}
 
@@ -758,117 +572,93 @@ namespace KHInsider
 		if (query != -1) {
 			finalUrl.Truncate(query);
 		}
-
-		if (!ParseAlbumPage(data, finalUrl, album)) {
-			if (pStatus) { *pStatus = FetchStatus::LayoutChanged; }
-			return false;
-		}
-
-		if (pStatus) { *pStatus = FetchStatus::Success; }
-		return true;
+		return ParseAlbumChecked(html, finalUrl, album, pStatus);
 	}
 
 	bool FetchAlbum(const CStringW& albumUrl, Album& album, FetchStatus* pStatus)
 	{
-		urlData data;
-		if (!FetchPage(albumUrl, CStringA(), data, nullptr, pStatus)) {
+		std::string html;
+		if (!FetchPage(albumUrl, CStringA(), html, nullptr, pStatus)) {
 			return false;
 		}
-
-		if (!ParseAlbumPage(data, albumUrl, album)) {
-			if (pStatus) { *pStatus = FetchStatus::LayoutChanged; }
-			return false;
-		}
-
-		if (pStatus) { *pStatus = FetchStatus::Success; }
-		return true;
+		return ParseAlbumChecked(html, albumUrl, album, pStatus);
 	}
 
 	CStringW ResolveTrackAudioUrl(const CStringW& trackPageUrl, FetchStatus* pStatus)
 	{
-		urlData data;
-		if (!FetchPage(trackPageUrl, CStringA(), data, nullptr, pStatus)) {
-			return L"";
+		std::string html;
+		if (!FetchPage(trackPageUrl, CStringA(), html, nullptr, pStatus)) {
+			return CStringW();
 		}
+		SaveDebugPage(L"track.html", html);
 
-		const std::string html(data.data());
-
-		static const std::regex reAudio("<audio[^>]*\\ssrc=\"([^\"]+)\"", std::regex::icase);
-		static const std::regex reMp3("href=\"(https?://[^\"]+\\.mp3)\"", std::regex::icase);
-		static const std::regex reOther("href=\"(https?://[^\"]+\\.(flac|m4a|ogg))\"", std::regex::icase);
-
-		std::smatch match;
-		if (std::regex_search(html, match, reAudio)
-				|| std::regex_search(html, match, reMp3)
-				|| std::regex_search(html, match, reOther)) {
-			return DecodeHtmlEntities(UTF8ToWStr(match[1].str().c_str()));
-		}
-
-		KHLog(L"no audio URL found on %s", trackPageUrl.GetString());
-		return L"";
-	}
-
-	bool DownloadToFile(const CStringW& url, const CStringW& localPath)
-	{
-		urlData data;
-		if (!URLRequest(L"GET", url, CStringA(), data) || data.size() < 2) {
-			return false;
-		}
-
-		CFile f;
-		if (!f.Open(localPath, CFile::modeCreate | CFile::modeWrite | CFile::shareExclusive)) {
-			return false;
-		}
-		// URLRequest appends a trailing '\0' for string callers; drop it here
-		f.Write(data.data(), static_cast<UINT>(data.size() - 1));
-		f.Close();
-		return true;
-	}
-
-	CStringW AlbumUrlFromAudioUrl(const CStringW& audioUrl)
-	{
-		// CDN audio: https://<cdn>/soundtracks/<slug>/<hash>/NN.%20Track.mp3
-		const int marker = audioUrl.Find(L"/soundtracks/");
-		if (marker < 0) {
-			return L"";
-		}
-		const int start = marker + 13; // length of "/soundtracks/"
-		const int slash = audioUrl.Find(L'/', start);
-		if (slash < 0 || slash <= start) {
-			return L"";
-		}
-		const CStringW slug = audioUrl.Mid(start, slash - start);
-		if (slug.IsEmpty()) {
-			return L"";
-		}
-		return CStringW(KHINSIDER_BASE) + L"/game-soundtracks/album/" + slug;
-	}
-
-	// Title-only spoken check: drama/voice keywords (English + Japanese). Used for
-	// individual track names and for whole album titles - a "...Mini Drama" or
-	// "Drama CD" / "Voice Collection" album is entirely spoken, so the whole
-	// album can be skipped without analyzing each track.
-	bool IsSpokenTitle(const CStringW& title)
-	{
-		CStringW lower = title;
-		lower.MakeLower();
-		static const LPCWSTR spokenWords[] = {
-			L"dialogue", L"dialog", L"voice", L"narration", L"narrator", L"monologue",
-			L"interview", L"commentary", L"drama cd", L"mini drama", L"audio drama",
-			L"radio drama", L"drama disc", L"drama track", L"voice drama", L"vocal drama",
-			L"voice collection", L"skit", L"cutscene", L"cut scene", L"voice clip", L"voices",
-			L"\u30DC\u30A4\u30B9",                 // voice (boisu)
-			L"\u30BB\u30EA\u30D5",                 // serifu (spoken lines)
-			L"\u30C9\u30E9\u30DE",                 // drama
-			L"\u30CA\u30EC\u30FC\u30B7\u30E7\u30F3", // narration
-			L"\u4F1A\u8A71",                       // kaiwa (conversation)
-		};
-		for (const auto w : spokenWords) {
-			if (lower.Find(w) != -1) {
-				return true;
+		const CStringW audio = ExtractTrackAudioUrl(html, PreferredAudioFormat());
+		if (audio.IsEmpty()) {
+			KHLog::Format(L"no audio URL found on %s - KHInsider's track page format may have changed", trackPageUrl.GetString());
+			if (pStatus) {
+				*pStatus = FetchStatus::LayoutChanged;
 			}
+			return CStringW();
 		}
-		return false;
+		if (!IsAllowedMediaUrl(audio)) {
+			KHLog::Format(L"audio link on %s is not on KHInsider's servers - ignored: %s", trackPageUrl.GetString(), audio.GetString());
+			if (pStatus) {
+				*pStatus = FetchStatus::LayoutChanged;
+			}
+			return CStringW();
+		}
+		return audio;
+	}
+
+	bool DownloadToFile(const CStringW& url, const CStringW& localPath, size_t maxBytes)
+	{
+		if (!IsAllowedMediaUrl(url)) {
+			KHLog::Format(L"download refused, not a KHInsider host: %s", url.GetString());
+			return false;
+		}
+		urlData data;
+		if (!HttpGetBytes(url, data, maxBytes) || data.empty()) {
+			return false;
+		}
+		// plain Win32 writes: a full disk fails the download instead of throwing
+		HANDLE h = CreateFileW(localPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h == INVALID_HANDLE_VALUE) {
+			KHLog::Format(L"download: could not create %s (error %lu)", localPath.GetString(), GetLastError());
+			return false;
+		}
+		DWORD written = 0;
+		const bool ok = WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) && written == data.size();
+		const DWORD err = GetLastError();
+		CloseHandle(h);
+		if (!ok) {
+			KHLog::Format(L"download: could not write %s (error %lu)", localPath.GetString(), err);
+			DeleteFileW(localPath);
+		}
+		return ok;
+	}
+
+	bool DownloadAudioToFile(const CStringW& url, const CStringW& localPath, size_t maxBytes, const std::function<bool()>& cancelled)
+	{
+		constexpr long kAudioTimeoutMs = 240000; // a whole track, not a page
+		if (!IsAllowedMediaUrl(url)) {
+			KHLog::Format(L"download refused, not a KHInsider host: %s", url.GetString());
+			return false;
+		}
+		HANDLE h = CreateFileW(localPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+		if (h == INVALID_HANDLE_VALUE) {
+			KHLog::Format(L"download: could not create %s (error %lu)", localPath.GetString(), GetLastError());
+			return false;
+		}
+		Sink sink;
+		sink.file = h;
+		sink.maxBytes = maxBytes;
+		sink.cancelled = &cancelled;
+		const bool ok = HttpGet(url, sink, nullptr, kAudioTimeoutMs, kAudioTimeoutMs) && !sink.Cancelled();
+		CloseHandle(h);
+		if (!ok) {
+			DeleteFileW(localPath);
+		}
+		return ok;
 	}
 
 	// Spectral-flux threshold separating speech (low flux) from music (high flux).
@@ -876,8 +666,7 @@ namespace KHInsider
 	// debug log if the decode path or sample rate changes.
 	constexpr double KH_FLUX_MAX = 10.0;
 
-	// Small self-contained in-place radix-2 FFT (n must be a power of two). Avoids
-	// pulling in an external FFT just for the speech/music spectral-flux feature.
+	// Small self-contained in-place radix-2 FFT (n must be a power of two).
 	static void KHFFT(double* re, double* im, int n)
 	{
 		constexpr double kPi = 3.14159265358979323846;
@@ -886,8 +675,8 @@ namespace KHInsider
 			for (; j & bit; bit >>= 1) { j ^= bit; }
 			j ^= bit;
 			if (i < j) {
-				double t = re[i]; re[i] = re[j]; re[j] = t;
-				t = im[i]; im[i] = im[j]; im[j] = t;
+				std::swap(re[i], re[j]);
+				std::swap(im[i], im[j]);
 			}
 		}
 		for (int len = 2; len <= n; len <<= 1) {
@@ -896,11 +685,11 @@ namespace KHInsider
 			for (int i = 0; i < n; i += len) {
 				double cr = 1.0, ci = 0.0;
 				for (int k = 0; k < len / 2; k++) {
-					const double pr = re[i + k], pi = im[i + k];
+					const double pr = re[i + k], pim = im[i + k];
 					const double qr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
 					const double qi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
-					re[i + k] = pr + qr; im[i + k] = pi + qi;
-					re[i + k + len / 2] = pr - qr; im[i + k + len / 2] = pi - qi;
+					re[i + k] = pr + qr; im[i + k] = pim + qi;
+					re[i + k + len / 2] = pr - qr; im[i + k + len / 2] = pim - qi;
 					const double ncr = cr * wr - ci * wi;
 					ci = cr * wi + ci * wr; cr = ncr;
 				}
@@ -909,9 +698,8 @@ namespace KHInsider
 	}
 
 	// Mean per-frame change of the magnitude spectrum over the prefix (1024-sample
-	// frames, hop 512, Hann window) - matches the Python prototype the threshold was
-	// tuned against. Music keeps introducing new notes/timbres (high flux); speech
-	// does not (low flux).
+	// frames, hop 512, Hann window). Music keeps introducing new notes/timbres
+	// (high flux); speech does not (low flux).
 	static double SpectralFlux(const std::vector<float>& mono)
 	{
 		constexpr int N = 1024, HOP = 512, BINS = N / 2 + 1;
@@ -943,25 +731,51 @@ namespace KHInsider
 		return frames > 0 ? fluxSum / frames : 0.0;
 	}
 
+	static bool IsMp3Url(const CStringW& url)
+	{
+		CStringW path = url;
+		const int q = path.FindOneOf(L"?#");
+		if (q != -1) {
+			path.Truncate(q);
+		}
+		return path.GetLength() > 4 && path.Right(4).CompareNoCase(L".mp3") == 0;
+	}
+
 	// Classify a track as music, spoken, or (near-)silent. First a cheap title
-	// check for spoken content, then a content analysis of a downloaded prefix:
-	// a prefix that never gets above a faint loudness is treated as empty/quiet;
-	// speech has a characteristic ~4 Hz syllabic energy modulation, more pauses,
-	// and higher zero-crossing-rate variance than music. Conservative thresholds
-	// favour keeping music; every decision is logged so cut-offs can be tuned.
+	// check for spoken content, then a content analysis of a downloaded prefix.
+	// Conservative thresholds favour keeping music; every decision is logged.
 	AudioVerdict ClassifyTrackAudio(const CStringW& audioUrl, const CStringW& trackName)
 	{
-		constexpr double kQuietPeakRms = 0.015; // prefix never louder than this -> empty/quiet
+		constexpr size_t kPrefix = 262144;       // ~256 KB, enough for ~10-15 s
 
 		if (IsSpokenTitle(trackName)) {
-			KHLog(L"audio check '%s': title match -> SPOKEN", trackName.GetString());
+			KHLog::Format(L"audio check '%s': title match -> SPOKEN", trackName.GetString());
 			return AudioVerdict::Spoken;
 		}
+		if (!IsMp3Url(audioUrl)) {
+			return AudioVerdict::Music; // only mp3 can be decoded here -> keep
+		}
 
-		// download a short prefix (~256 KB, enough for ~10-15s)
 		urlData mp3;
-		if (!URLRequest(L"GET", audioUrl, CStringA(), mp3, nullptr, L"Range: bytes=0-262143\r\n", 262144) || mp3.size() < 8192) {
+		if (!HttpGetBytes(audioUrl, mp3, kPrefix, true, L"Range: bytes=0-262143\r\n") || mp3.size() < 8192) {
 			return AudioVerdict::Music; // can't analyse -> keep the track
+		}
+
+		// A big ID3v2 tag (embedded cover art) can fill the whole prefix; then
+		// fetch the audio that follows it instead.
+		size_t offset = Id3v2TagSize(reinterpret_cast<const unsigned char*>(mp3.data()), mp3.size());
+		if (offset > 0 && offset + 65536 > mp3.size()) {
+			if (offset > 32u * 1024 * 1024) {
+				return AudioVerdict::Music;
+			}
+			CStringW range;
+			range.Format(L"Range: bytes=%llu-%llu\r\n", static_cast<unsigned long long>(offset),
+				static_cast<unsigned long long>(offset + kPrefix - 1));
+			KHLog::Format(L"audio check '%s': %u-byte ID3 tag - fetching the audio after it", trackName.GetString(), static_cast<unsigned>(offset));
+			if (!HttpGetBytes(audioUrl, mp3, kPrefix, true, range) || mp3.size() < 8192) {
+				return AudioVerdict::Music;
+			}
+			offset = 0;
 		}
 
 		// decode to mono float PCM
@@ -969,13 +783,13 @@ namespace KHInsider
 		mp3dec_init(&dec);
 		mp3dec_frame_info_t info = {};
 		std::vector<float> mono;
-		const uint8_t* buf = reinterpret_cast<const uint8_t*>(mp3.data());
-		int bytesLeft = static_cast<int>(mp3.size()) - 1; // drop appended '\0'
+		const uint8_t* buf = reinterpret_cast<const uint8_t*>(mp3.data()) + offset;
+		int bytesLeft = static_cast<int>(mp3.size() - offset);
 		int hz = 0;
-		short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+		std::vector<short> pcm(MINIMP3_MAX_SAMPLES_PER_FRAME);
 		const size_t maxSamples = 30u * 48000u;
 		while (bytesLeft > 0 && mono.size() < maxSamples) {
-			const int samples = mp3dec_decode_frame(&dec, buf, bytesLeft, pcm, &info);
+			const int samples = mp3dec_decode_frame(&dec, buf, bytesLeft, pcm.data(), &info);
 			if (info.frame_bytes <= 0) {
 				break;
 			}
@@ -995,18 +809,24 @@ namespace KHInsider
 			}
 		}
 
+		return ClassifyMonoPcm(mono, hz, trackName);
+	}
+
+	AudioVerdict ClassifyMonoPcm(const std::vector<float>& mono, int hz, const CStringW& trackName)
+	{
+		constexpr double kQuietPeakRms = 0.015; // prefix never louder than this -> empty/quiet
 		if (hz <= 0 || mono.size() < static_cast<size_t>(hz)) {
 			return AudioVerdict::Music; // need at least ~1s of audio to judge -> keep
 		}
 
 		// 20 ms frames -> energy envelope (50 fps) and zero-crossing rate
 		const int frameLen = hz / 50;
-		const int nFrames = static_cast<int>(mono.size() / frameLen);
+		const int nFrames = frameLen > 0 ? static_cast<int>(mono.size() / static_cast<size_t>(frameLen)) : 0;
 		if (frameLen < 1 || nFrames < 25) {
 			return AudioVerdict::Music;
 		}
 
-		std::vector<float> energy(nFrames), zcr(nFrames);
+		std::vector<float> energy(static_cast<size_t>(nFrames)), zcr(static_cast<size_t>(nFrames));
 		double maxE = 0.0;
 		for (int f = 0; f < nFrames; f++) {
 			const float* x = &mono[static_cast<size_t>(f) * frameLen];
@@ -1020,214 +840,54 @@ namespace KHInsider
 			}
 			energy[f] = static_cast<float>(std::sqrt(e / frameLen));
 			zcr[f] = static_cast<float>(zc) / frameLen;
-			if (energy[f] > maxE) maxE = energy[f];
+			if (energy[f] > maxE) {
+				maxE = energy[f];
+			}
 		}
 
 		double meanE = 0.0;
-		for (const float e : energy) meanE += e;
+		for (const float e : energy) {
+			meanE += e;
+		}
 		meanE /= nFrames;
 
 		// empty/very quiet: the loudest 20 ms in the whole prefix is still faint
 		if (maxE < kQuietPeakRms) {
-			KHLog(L"audio check '%s': peak=%.4f mean=%.4f -> QUIET", trackName.GetString(), maxE, meanE);
+			KHLog::Format(L"audio check '%s': peak=%.4f mean=%.4f -> QUIET", trackName.GetString(), maxE, meanE);
 			return AudioVerdict::Quiet;
 		}
 
 		int pauses = 0;
-		for (const float e : energy) if (e < 0.25 * meanE) pauses++;
+		for (const float e : energy) {
+			if (e < 0.25 * meanE) {
+				pauses++;
+			}
+		}
 		const double pauseRatio = static_cast<double>(pauses) / nFrames;
 
 		double meanZ = 0.0;
-		for (const float z : zcr) meanZ += z;
+		for (const float z : zcr) {
+			meanZ += z;
+		}
 		meanZ /= nFrames;
 		double varZ = 0.0;
-		for (const float z : zcr) varZ += (z - meanZ) * (z - meanZ);
+		for (const float z : zcr) {
+			varZ += (z - meanZ) * (z - meanZ);
+		}
 		varZ /= nFrames;
 		const double zcrCoV = meanZ > 1e-6 ? std::sqrt(varZ) / meanZ : 0.0;
 
-		// Spectral flux (mean per-frame change of the magnitude spectrum) is the key
-		// speech/music discriminator: music constantly introduces new notes/timbres
-		// (high flux), speech does not (low flux). Within the low-flux zone, real
-		// speech also shows either high zero-crossing-rate variance (continuous
-		// dialogue) or a high pause ratio (gappy/dramatic speech); sparse music shows
-		// neither. Validated on 29 labelled tracks (13 spoken / 16 music): 13/13
-		// recall, 0 false-positives. Replaces the old 4 Hz-modulation heuristic,
-		// which mis-flagged rhythmic/ambient music and missed continuous dialogue.
+		// Spectral flux is the key speech/music discriminator; within the low-flux
+		// zone, real speech also shows either high zero-crossing-rate variance
+		// (continuous dialogue) or a high pause ratio (gappy/dramatic speech).
+		// Validated on 29 labelled tracks (13 spoken / 16 music): 13/13 recall,
+		// 0 false positives.
 		const double flux = SpectralFlux(mono);
 		const bool spoken = (flux < KH_FLUX_MAX) && (zcrCoV > 0.70 || pauseRatio > 0.30);
 
-		KHLog(L"audio check '%s': flux=%.1f pause=%.2f zcrCoV=%.2f peak=%.3f -> %s",
-			  trackName.GetString(), flux, pauseRatio, zcrCoV, maxE, spoken ? L"SPOKEN" : L"music");
+		KHLog::Format(L"audio check '%s': flux=%.1f pause=%.2f zcrCoV=%.2f peak=%.3f -> %s",
+			trackName.GetString(), flux, pauseRatio, zcrCoV, maxE, spoken ? L"SPOKEN" : L"music");
 
 		return spoken ? AudioVerdict::Spoken : AudioVerdict::Music;
 	}
-} // namespace KHInsider
-
-// CKHRadioHistory
-
-CStringW CKHRadioHistory::GetPath() const
-{
-	return KHRadioData::AppDataDir() + L"khradio_history.json";
-}
-
-void CKHRadioHistory::Load()
-{
-	m_albums.clear();
-
-	const CStringW path = GetPath();
-	if (path.IsEmpty() || !::PathFileExistsW(path)) {
-		return;
-	}
-
-	std::vector<char> data;
-	CFile file;
-	if (!file.Open(path, CFile::modeRead | CFile::shareDenyWrite)) {
-		return;
-	}
-	const auto len = static_cast<UINT>(file.GetLength());
-	data.resize(len + 1);
-	file.Read(data.data(), len);
-	data[len] = '\0';
-	file.Close();
-
-	rapidjson::Document json;
-	json.Parse(data.data());
-	if (json.HasParseError()) {
-		return;
-	}
-
-	if (const auto* albums = GetJsonArray(json, "albums")) {
-		for (const auto& a : albums->GetArray()) {
-			if (!a.IsObject()) {
-				continue;
-			}
-			AlbumEntry entry;
-			getJsonValue(a, "url", entry.url);
-			getJsonValue(a, "title", entry.title);
-			if (entry.url.IsEmpty()) {
-				continue;
-			}
-			if (const auto* tracks = GetJsonArray(a, "tracks")) {
-				for (const auto& t : tracks->GetArray()) {
-					if (!t.IsObject()) {
-						continue;
-					}
-					TrackEntry te;
-					getJsonValue(t, "name", te.name);
-					getJsonValue(t, "plays", te.plays);
-					if (!te.name.IsEmpty()) {
-						entry.tracks.emplace_back(te);
-					}
-				}
-			}
-			m_albums.emplace_back(entry);
-		}
-	}
-}
-
-void CKHRadioHistory::Save() const
-{
-	const CStringW path = GetPath();
-	if (path.IsEmpty()) {
-		return;
-	}
-
-	rapidjson::StringBuffer sb;
-	rapidjson::Writer<rapidjson::StringBuffer> w(sb);
-
-	w.StartObject();
-	w.Key("albums");
-	w.StartArray();
-	for (const auto& album : m_albums) {
-		w.StartObject();
-		w.Key("url");
-		const CStringA url(WStrToUTF8(album.url));
-		w.String(url.GetString(), url.GetLength());
-		w.Key("title");
-		const CStringA title(WStrToUTF8(album.title));
-		w.String(title.GetString(), title.GetLength());
-		w.Key("tracks");
-		w.StartArray();
-		for (const auto& track : album.tracks) {
-			w.StartObject();
-			w.Key("name");
-			const CStringA name(WStrToUTF8(track.name));
-			w.String(name.GetString(), name.GetLength());
-			w.Key("plays");
-			w.Int(track.plays);
-			w.EndObject();
-		}
-		w.EndArray();
-		w.EndObject();
-	}
-	w.EndArray();
-	w.EndObject();
-
-	CFile file;
-	if (file.Open(path, CFile::modeCreate | CFile::modeWrite | CFile::shareExclusive)) {
-		file.Write(sb.GetString(), static_cast<UINT>(sb.GetSize()));
-		file.Close();
-	}
-}
-
-bool CKHRadioHistory::ContainsAlbum(const CStringW& albumUrl) const
-{
-	for (const auto& album : m_albums) {
-		if (album.url.CompareNoCase(albumUrl) == 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
-void CKHRadioHistory::RecordTrack(const CStringW& albumUrl, const CStringW& albumTitle, const CStringW& trackName)
-{
-	if (albumUrl.IsEmpty()) {
-		return;
-	}
-
-	size_t idx = m_albums.size();
-	for (size_t i = 0; i < m_albums.size(); i++) {
-		if (m_albums[i].url.CompareNoCase(albumUrl) == 0) {
-			idx = i;
-			break;
-		}
-	}
-
-	if (idx == m_albums.size()) {
-		AlbumEntry entry;
-		entry.url = albumUrl;
-		entry.title = albumTitle;
-		m_albums.insert(m_albums.begin(), entry);
-		idx = 0;
-	} else if (idx > 0) {
-		// most recently listened first
-		AlbumEntry entry = m_albums[idx];
-		m_albums.erase(m_albums.begin() + idx);
-		m_albums.insert(m_albums.begin(), entry);
-		idx = 0;
-	}
-
-	if (!albumTitle.IsEmpty()) {
-		m_albums[idx].title = albumTitle;
-	}
-
-	if (!trackName.IsEmpty()) {
-		bool found = false;
-		for (auto& track : m_albums[idx].tracks) {
-			if (track.name.CompareNoCase(trackName) == 0) {
-				track.plays++;
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			TrackEntry te;
-			te.name = trackName;
-			te.plays = 1;
-			m_albums[idx].tracks.emplace_back(te);
-		}
-	}
-
-	Save();
 }

@@ -2,9 +2,12 @@
 // GPL-3.0-or-later (see COPYING.txt).
 #include "stdafx.h"
 #include "AppData.h"
+#include "AudioCache.h"
 #include "KHInsider.h"
+#include "Log.h"
 #include "MainWnd.h"
 #include "UiKit.h"
+#include "Version.h"
 
 #include <shobjidl.h>
 
@@ -53,7 +56,7 @@ BOOL CKHRadioApp::InitInstance()
 	}
 
 	CWinApp::InitInstance();
-	if (!AfxOleInit()) { // STA for WebView2 and WIC
+	if (!AfxOleInit()) { // STA for WebView2, WIC and the media controls
 		return FALSE;
 	}
 	INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES };
@@ -61,15 +64,28 @@ BOOL CKHRadioApp::InitInstance()
 
 	KHTheme::InitDarkModeSupport();
 
-	KHInsider::DebugLog(L"---- KH Radio starting ----");
-	KHRadioData::CarryOverHistory();
-	KHRadioData::CarryOverWebViewProfile();
-	KHRadioData::Load();
+	KHLog::SetPath(KHRadioData::LogPath());
+	KHLog::Line(L"---- KH Radio " _CRT_WIDE(KHRADIO_VERSION_STR) L" starting ----");
+	const auto settingsResult = KHRadioData::Load();
+	KHRadioData::RunCarryOver(settingsResult);
+	KHRadioData::MigrateCoverCache();
+	// Only this instance uses the audio cache (the mutex above): files left by
+	// an earlier run that ended badly are spent.
+	KHAudioCache::SetDir(KHRadioData::CacheDir());
+	KHAudioCache::ClearAll();
+	if (!KHRadioData::Get().preferAudioFormat.IsEmpty()) {
+		KHInsider::SetPreferredAudioFormat(KHRadioData::Get().preferAudioFormat);
+		KHLog::Format(L"settings: tracks in %s are taken first where offered", KHRadioData::Get().preferAudioFormat.GetString());
+	}
+	if (KHRadioData::Get().saveDebugPages) {
+		KHInsider::SetDebugPageDir(KHRadioData::DebugDir());
+		KHLog::Format(L"debug: saving the last album and track pages in %s", KHRadioData::DebugDir().GetString());
+	}
 
 	auto* wnd = new CMainWnd;
 	m_pMainWnd = wnd;
 	if (!wnd->CreateMain()) {
-		KHInsider::DebugLog(L"could not create the main window");
+		KHLog::Line(L"could not create the main window");
 		m_pMainWnd = nullptr;
 		return FALSE;
 	}
@@ -79,6 +95,9 @@ BOOL CKHRadioApp::InitInstance()
 int CKHRadioApp::ExitInstance()
 {
 	KHRadioData::Save();
+	KHAudioCache::ClearAll();
+	KHLog::Line(L"---- KH Radio exiting ----");
+
 	if (m_mutex) {
 		CloseHandle(m_mutex);
 		m_mutex = nullptr;

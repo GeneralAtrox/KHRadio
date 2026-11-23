@@ -5,6 +5,11 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KHRadio", "KHRadio.vcxproj", "{6F4C2B7E-3D2A-4E8B-9C61-5A0D7E1B4C2F}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "KHRadioTests", "tests\KHRadioTests.vcxproj", "{A3E1C9D4-5B7F-4F2A-8E6D-1C0B9A8F7E21}"
+	ProjectSection(ProjectDependencies) = postProject
+		{6F4C2B7E-3D2A-4E8B-9C61-5A0D7E1B4C2F} = {6F4C2B7E-3D2A-4E8B-9C61-5A0D7E1B4C2F}
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -15,6 +20,10 @@ Global
 		{6F4C2B7E-3D2A-4E8B-9C61-5A0D7E1B4C2F}.Debug|x64.Build.0 = Debug|x64
 		{6F4C2B7E-3D2A-4E8B-9C61-5A0D7E1B4C2F}.Release|x64.ActiveCfg = Release|x64
 		{6F4C2B7E-3D2A-4E8B-9C61-5A0D7E1B4C2F}.Release|x64.Build.0 = Release|x64
+		{A3E1C9D4-5B7F-4F2A-8E6D-1C0B9A8F7E21}.Debug|x64.ActiveCfg = Debug|x64
+		{A3E1C9D4-5B7F-4F2A-8E6D-1C0B9A8F7E21}.Debug|x64.Build.0 = Debug|x64
+		{A3E1C9D4-5B7F-4F2A-8E6D-1C0B9A8F7E21}.Release|x64.ActiveCfg = Release|x64
+		{A3E1C9D4-5B7F-4F2A-8E6D-1C0B9A8F7E21}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

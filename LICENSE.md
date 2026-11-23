@@ -14,6 +14,10 @@ Third-party components keep their own licences:
 
 - `thirdparty/rapidjson` - MIT (see `thirdparty/rapidjson/license.txt`).
 - `thirdparty/minimp3` - CC0 / public domain (see the header of `minimp3.h`).
+- `thirdparty/stb_vorbis` - `stb_vorbis.c` v1.25 by Sean Barrett, from
+  https://github.com/nothings/stb (commit 033efa1bcb750136ac98e997d53833b758e0089b,
+  unmodified): MIT or public domain, at your choice (see the end of the file).
+
 - `thirdparty/curl-impersonate` - libcurl (curl licence) and zlib (zlib licence)
   runtime DLLs, see `thirdparty/curl-impersonate/README.md`.
 - The WebView2 SDK is downloaded at build time from NuGet under Microsoft's licence.

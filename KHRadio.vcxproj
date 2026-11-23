@@ -30,14 +30,17 @@
     <OutDir>$(MSBuildThisFileDirectory)_build\$(Configuration)\</OutDir>
     <IntDir>$(MSBuildThisFileDirectory)_build\obj\$(Configuration)\</IntDir>
     <TargetName>KHRadio</TargetName>
+    <!-- the version lives only in src\Version.h; the manifest identity is read from it -->
+    <KHRadioVersionText>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)src\Version.h'))</KHRadioVersionText>
+    <KHRadioVersion>$([System.Text.RegularExpressions.Regex]::Replace($(KHRadioVersionText), '(?s)^.*?KHRADIO_VERSION_STR4\s+"([0-9.]+)".*$', '$1'))</KHRadioVersion>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <WarningLevel>Level3</WarningLevel>
+      <WarningLevel>Level4</WarningLevel>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <SDLCheck>false</SDLCheck>
-      <ConformanceMode>false</ConformanceMode>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(MSBuildThisFileDirectory)thirdparty;$(MSBuildThisFileDirectory)thirdparty\rapidjson\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;RAPIDJSON_SSE2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -48,10 +51,11 @@
     </ResourceCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>mfplat.lib;mfuuid.lib;windowscodecs.lib;dwmapi.lib;uxtheme.lib;msimg32.lib;winhttp.lib;shlwapi.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>mfplat.lib;mfuuid.lib;windowscodecs.lib;dwmapi.lib;uxtheme.lib;msimg32.lib;winhttp.lib;shlwapi.lib;comctl32.lib;runtimeobject.lib;shcore.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableDpiAwareness>false</EnableDpiAwareness>
+      <AssemblyIdentity>KHRadio, type=win32, version=$(KHRadioVersion), processorArchitecture=amd64</AssemblyIdentity>
       <AdditionalManifestFiles>$(MSBuildThisFileDirectory)src\KHRadio.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
     </Manifest>
     <PostBuildEvent>
@@ -84,27 +88,48 @@
   <ItemGroup>
     <ClCompile Include="src\App.cpp" />
     <ClCompile Include="src\AppData.cpp" />
+    <ClCompile Include="src\AudioCache.cpp" />
+    <ClCompile Include="src\FileUtil.cpp" />
+    <ClCompile Include="src\History.cpp" />
     <ClCompile Include="src\KHInsider.cpp" />
+    <ClCompile Include="src\KHParse.cpp" />
     <ClCompile Include="src\KHRadioDlg.cpp" />
     <ClCompile Include="src\KHWebSession.cpp" />
+    <ClCompile Include="src\Log.cpp" />
     <ClCompile Include="src\MainWnd.cpp" />
+    <ClCompile Include="src\MediaSession.cpp" />
     <ClCompile Include="src\Player.cpp" />
     <ClCompile Include="src\UiKit.cpp" />
+    <ClCompile Include="thirdparty\stb_vorbis\stb_vorbis.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>STB_VORBIS_NO_PUSHDATA_API;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\AppData.h" />
+    <ClInclude Include="src\AudioCache.h" />
+
+    <ClInclude Include="src\FileUtil.h" />
+    <ClInclude Include="src\History.h" />
     <ClInclude Include="src\JsonHelper.h" />
     <ClInclude Include="src\KHInsider.h" />
+    <ClInclude Include="src\KHParse.h" />
     <ClInclude Include="src\KHRadioDlg.h" />
     <ClInclude Include="src\KHRadioLayout.h" />
     <ClInclude Include="src\KHWebSession.h" />
+    <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\MainWnd.h" />
+    <ClInclude Include="src\MediaSession.h" />
     <ClInclude Include="src\Player.h" />
     <ClInclude Include="src\RadioTypes.h" />
+    <ClInclude Include="src\RapidJson.h" />
     <ClInclude Include="src\resource.h" />
     <ClInclude Include="src\stdafx.h" />
     <ClInclude Include="src\TextUtil.h" />
     <ClInclude Include="src\UiKit.h" />
+    <ClInclude Include="src\Version.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\KHRadio.rc" />

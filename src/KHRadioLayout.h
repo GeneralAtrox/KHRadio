@@ -1,3 +1,6 @@
+// KH Radio - DPI-aware placement of the radio panel's controls (pure geometry, tested).
+// Derived from the KH Radio panel of the MPC-BE fork (MPC-BE, GPLv3).
+// GPL-3.0-or-later (see COPYING.txt).
 #pragma once
 #include <windows.h>
 #include <algorithm>

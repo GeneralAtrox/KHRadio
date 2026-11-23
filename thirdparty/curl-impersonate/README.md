@@ -4,8 +4,7 @@ KH Radio uses [curl-impersonate](https://github.com/lexiforest/curl-impersonate)
 as an optional, Cloudflare-resilient HTTP transport for `downloads.khinsider.com`.
 It forges a real Chrome TLS/HTTP-2 fingerprint, which gets through Cloudflare's
 bot challenge on networks where plain WinHTTP is blocked (a 403 / "Just a
-moment..." page). See `src/apps/mplayerc/KHInsider.cpp` (`URLRequestCurl` /
-`URLRequest` dispatcher).
+moment..." page). See `src/KHInsider.cpp` (`CurlGet`, with `WinHttpGet` as the fallback).
 
 ## Files
 
@@ -19,7 +18,7 @@ Both are taken from the official release asset
 
 Dependencies are Windows system DLLs only (crypt32, iphlpapi, ws2_32,
 normaliz, wldap32, kernel32) — **no VC++ runtime required**. They must sit
-next to `mpc-be64.exe`.
+next to `KHRadio.exe`.
 
 ## How it's used
 
@@ -36,7 +35,7 @@ starts failing with curl challenges:
 
 1. Download the newest `libcurl-impersonate-vX.Y.Z.x86_64-win32.tar.gz` from
    the [releases page](https://github.com/lexiforest/curl-impersonate/releases).
-2. Replace `libcurl-impersonate.dll` + `zlib.dll` here and in the release zip.
+2. Replace `libcurl-impersonate.dll` + `zlib.dll` here.
 3. Bump `KH_IMPERSONATE_TARGET` in `KHInsider.cpp` to the newest `chromeNNN`
    target the new DLL supports (check `bin/curl_chromeNNN.bat` in the tarball).
 

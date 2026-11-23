@@ -7,12 +7,22 @@
 
 namespace KHRadioData
 {
-	// %APPDATA%\KHRadio\ (trailing backslash), created on first use.
+	// %APPDATA%\KHRadio\ (trailing backslash), created on first use: settings,
+	// history, queue, debug log.
 	CStringW AppDataDir();
-	// %APPDATA%\KHRadio\covers\ (trailing backslash), created on first use.
+	// %LOCALAPPDATA%\KHRadio\ (trailing backslash): caches and the browser profile.
+	CStringW LocalDataDir();
+	// %LOCALAPPDATA%\KHRadio\covers\ (trailing backslash), created on first use.
 	CStringW CoverDir();
 	// %LOCALAPPDATA%\KHRadio\WebView2 (no trailing backslash).
 	CStringW WebViewProfileDir();
+	// %LOCALAPPDATA%\KHRadio\cache\ (trailing backslash), created on first use:
+	// Ogg tracks decoded to WAV, fallback m4a downloads. Emptied at start and exit.
+	CStringW CacheDir();
+	// %LOCALAPPDATA%\KHRadio\debug\ - pages saved when saveDebugPages is on.
+	CStringW DebugDir();
+	CStringW HistoryPath();
+	CStringW LogPath();
 
 	struct Settings {
 		CStringW types;      // csv of the site's form values
@@ -25,18 +35,32 @@ namespace KHRadioData
 		bool hasPlacement = false;
 		RECT normalRect = {};
 		bool maximized = false;
+		bool saveDebugPages = false; // keep the last album/track page in DebugDir()
+		// Hidden (settings.json only): "ogg", "m4a", "mp3" or "flac" - take that
+		// format first when a track page offers it. Empty: mp3 first, as always.
+		CStringW preferAudioFormat;
+
+		bool carryOverDone = false;  // the first-run copy from the MPC-BE fork has run
+	};
+
+	enum class LoadResult {
+		Missing,    // no settings.json yet (first run)
+		Loaded,
+		Unreadable, // it could not be read or parsed: set aside (or, failing that, never overwritten)
 	};
 
 	Settings& Get();
-	// Loads settings.json; if it does not exist yet, imports the fork's KHRadio*
-	// values (read-only) from HKCU\Software\MPC-BE\Settings and writes the file.
-	void Load();
-	void Save();
+	LoadResult Load();
+	bool Save();
 
-	// First-run copies from the MPC-BE fork. Each runs only when the new
-	// location is empty and never moves or deletes the old data.
-	void CarryOverHistory();
-	void CarryOverWebViewProfile();
+	// First-run copies from the MPC-BE fork: its KHRadio* settings (read-only
+	// from HKCU\Software\MPC-BE\Settings), its history and its browser profile.
+	// Runs once, only on a real first run (no settings.json), and never moves or
+	// deletes the fork's data. Afterwards settings.json records carryOverDone.
+	void RunCarryOver(LoadResult settingsResult);
+
+	// Moves album covers from the 1.0 location (%APPDATA%\KHRadio\covers) to CoverDir().
+	void MigrateCoverCache();
 
 	struct SavedQueue {
 		std::vector<QueueItem> items;
@@ -44,5 +68,5 @@ namespace KHRadioData
 		double position = 0.0;
 	};
 	SavedQueue LoadQueue();
-	void SaveQueue(const std::vector<QueueItem>& items, int index, double position);
+	bool SaveQueue(const std::vector<QueueItem>& items, int index, double position);
 }

@@ -4,7 +4,7 @@
 #include "stdafx.h"
 #include "MainWnd.h"
 #include "AppData.h"
-#include "KHInsider.h"
+#include "Log.h"
 
 #include <dwmapi.h>
 #include <set>
@@ -26,7 +26,24 @@ namespace
 	constexpr wchar_t kGlyphMute = 0xE74F;
 	constexpr wchar_t kGlyphMusic = 0xE8D6;
 
-	enum HotKeyId { HK_PLAYPAUSE = 1, HK_NEXT, HK_PREV, HK_STOP };
+	// One key press can arrive both through the media controls and as
+	// WM_APPCOMMAND; the second copy within this time is ignored.
+	constexpr ULONGLONG kMediaDebounceMs = 300;
+
+	CStringW QueueText(const QueueItem& item)
+	{
+		CStringW s = item.label;
+		if (!item.ref.albumTitle.IsEmpty()) {
+			s += L"   \x2014   " + item.ref.albumTitle;
+		}
+		return s;
+	}
+
+	bool FileHasData(const CStringW& path)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA fa = {};
+		return !path.IsEmpty() && GetFileAttributesExW(path, GetFileExInfoStandard, &fa) && (fa.nFileSizeLow || fa.nFileSizeHigh);
+	}
 
 	CStringW FormatTime(double seconds)
 	{
@@ -86,7 +103,7 @@ BEGIN_MESSAGE_MAP(CMainWnd, CWnd)
 	ON_MESSAGE(WM_KHRADIO_SLIDER, OnSlider)
 	ON_MESSAGE(WM_DPICHANGED, OnDpiChanged)
 	ON_MESSAGE(WM_APPCOMMAND, OnAppCommand)
-	ON_MESSAGE(WM_HOTKEY, OnHotKey)
+	ON_MESSAGE(WM_KHRADIO_SMTC, OnMediaButton)
 	ON_MESSAGE(WM_DWMSENDICONICTHUMBNAIL, OnIconicThumbnail)
 	ON_MESSAGE(WM_DWMSENDICONICLIVEPREVIEWBITMAP, OnIconicLivePreview)
 END_MESSAGE_MAP()
@@ -172,35 +189,17 @@ int CMainWnd::OnCreate(LPCREATESTRUCT cs)
 		m_player.Append(item);
 	}
 	PruneCovers(true);
+	// Media keys, the volume flyout and the lock screen go through Windows'
+	// media controls; WM_APPCOMMAND still covers the focused window.
+	m_media.Initialize(m_hWnd);
+
 	if (saved.index >= 0 && audioOk) {
-		CStringW log;
-		log.Format(L"resume: %u queued item(s), playing #%d from %.0f s", static_cast<unsigned>(saved.items.size()), saved.index, saved.position);
-		KHInsider::DebugLog(log);
+		KHLog::Format(L"resume: %u queued item(s), playing #%d from %.0f s", static_cast<unsigned>(saved.items.size()), saved.index, saved.position);
 		m_player.PlayIndex(saved.index, saved.position, true);
 	}
 
-	RegisterMediaKeys();
 	SetTimer(kUiTimer, kUiTimerMs, nullptr);
 	return 0;
-}
-
-void CMainWnd::RegisterMediaKeys()
-{
-	// Global media keys while KH Radio runs; WM_APPCOMMAND still covers the
-	// focused window when another program already owns a key.
-	struct { int id; UINT vk; LPCWSTR name; } keys[] = {
-		{ HK_PLAYPAUSE, VK_MEDIA_PLAY_PAUSE, L"play/pause" },
-		{ HK_NEXT, VK_MEDIA_NEXT_TRACK, L"next" },
-		{ HK_PREV, VK_MEDIA_PREV_TRACK, L"previous" },
-		{ HK_STOP, VK_MEDIA_STOP, L"stop" },
-	};
-	for (const auto& k : keys) {
-		if (RegisterHotKey(m_hWnd, k.id, MOD_NOREPEAT, k.vk)) {
-			m_hotkeys = true;
-		} else {
-			KHInsider::DebugLog(CStringW(L"media key '") + k.name + L"' is taken by another program - only works while KH Radio has focus");
-		}
-	}
 }
 
 void CMainWnd::CreateFonts()
@@ -569,26 +568,50 @@ void CMainWnd::OnQueueDblClk()
 	}
 }
 
+void CMainWnd::MediaCommand(MediaCmd cmd, bool fromMediaControls)
+{
+	const ULONGLONG now = GetTickCount64();
+	if (fromMediaControls != m_lastMediaFromControls && now - m_lastMediaTick < kMediaDebounceMs) {
+		return; // the same key press, seen through the other path
+	}
+	m_lastMediaTick = now;
+	m_lastMediaFromControls = fromMediaControls;
+	switch (cmd) {
+		case MediaCmd::PlayPause: OnPlayPause(); break;
+		case MediaCmd::Play:
+			if (m_player.Queue().empty()) {
+				OnPlayPause();
+			} else {
+				m_player.Play();
+			}
+			break;
+		case MediaCmd::Pause: m_player.Pause(); break;
+		case MediaCmd::Next: m_player.Next(); break;
+		case MediaCmd::Prev: m_player.Prev(); break;
+	}
+}
+
 LRESULT CMainWnd::OnAppCommand(WPARAM, LPARAM lParam)
 {
 	switch (GET_APPCOMMAND_LPARAM(lParam)) {
-		case APPCOMMAND_MEDIA_PLAY_PAUSE: OnPlayPause(); return TRUE;
-		case APPCOMMAND_MEDIA_PLAY: m_player.Play(); return TRUE;
+		case APPCOMMAND_MEDIA_PLAY_PAUSE: MediaCommand(MediaCmd::PlayPause, false); return TRUE;
+		case APPCOMMAND_MEDIA_PLAY: MediaCommand(MediaCmd::Play, false); return TRUE;
 		case APPCOMMAND_MEDIA_PAUSE:
-		case APPCOMMAND_MEDIA_STOP: m_player.Pause(); return TRUE;
-		case APPCOMMAND_MEDIA_NEXTTRACK: m_player.Next(); return TRUE;
-		case APPCOMMAND_MEDIA_PREVIOUSTRACK: m_player.Prev(); return TRUE;
+		case APPCOMMAND_MEDIA_STOP: MediaCommand(MediaCmd::Pause, false); return TRUE;
+		case APPCOMMAND_MEDIA_NEXTTRACK: MediaCommand(MediaCmd::Next, false); return TRUE;
+		case APPCOMMAND_MEDIA_PREVIOUSTRACK: MediaCommand(MediaCmd::Prev, false); return TRUE;
 	}
 	return Default();
 }
 
-LRESULT CMainWnd::OnHotKey(WPARAM wParam, LPARAM)
+LRESULT CMainWnd::OnMediaButton(WPARAM wParam, LPARAM)
 {
-	switch (wParam) {
-		case HK_PLAYPAUSE: OnPlayPause(); break;
-		case HK_NEXT: m_player.Next(); break;
-		case HK_PREV: m_player.Prev(); break;
-		case HK_STOP: m_player.Pause(); break;
+	switch (static_cast<CMediaSession::Button>(wParam)) {
+		case CMediaSession::Button::Play: MediaCommand(MediaCmd::Play, true); break;
+		case CMediaSession::Button::Pause:
+		case CMediaSession::Button::Stop: MediaCommand(MediaCmd::Pause, true); break;
+		case CMediaSession::Button::Next: MediaCommand(MediaCmd::Next, true); break;
+		case CMediaSession::Button::Previous: MediaCommand(MediaCmd::Prev, true); break;
 	}
 	return 0;
 }
@@ -606,19 +629,32 @@ void CMainWnd::OnTrackStarted(int index, bool resumed)
 	const QueueItem item = m_player.Queue()[index]; // copy: the dialog may append
 	m_dlg.OnPlaybackStarted(item, resumed);
 	UpdateTitle();
+	UpdateMediaTrack();
 	RefreshQueueList();
 	Invalidate(FALSE);
 	KHRadioData::SaveQueue(m_player.Queue(), m_player.CurrentIndex(), resumed ? m_player.Position() : 0.0);
 }
 
-void CMainWnd::OnTrackEnded(int)
+void CMainWnd::OnNeedResolve(int)
 {
+	m_dlg.OnNeedResolve();
+}
+
+void CMainWnd::UpdateMediaTrack()
+{
+	const QueueItem* cur = m_player.Current();
+	if (!cur) {
+		m_media.ClearTrack();
+		return;
+	}
+	const CStringW cover = m_cover.IsLoaded() ? m_cover.Path() : (FileHasData(cur->ref.coverPath) ? cur->ref.coverPath : CStringW());
+	m_media.SetTrack(cur->ref.name, cur->ref.albumTitle, cover);
 }
 
 void CMainWnd::OnQueueEnded()
 {
 	if (!m_dlg.ContinueRadioAtEnd()) {
-		KHInsider::DebugLog(L"queue ended - radio not active, stopping");
+		KHLog::Line(L"queue ended - radio not active, stopping");
 	}
 	UpdateTitle();
 	Invalidate(FALSE);
@@ -643,6 +679,12 @@ void CMainWnd::OnStateChanged()
 {
 	const auto state = m_player.GetState();
 	m_play.SetGlyph(state == CRadioPlayer::State::Playing || state == CRadioPlayer::State::Loading ? kGlyphPause : kGlyphPlay);
+	switch (state) {
+		case CRadioPlayer::State::Playing: m_media.SetStatus(CMediaSession::Status::Playing); break;
+		case CRadioPlayer::State::Loading: m_media.SetStatus(CMediaSession::Status::Changing); break;
+		case CRadioPlayer::State::Paused: m_media.SetStatus(CMediaSession::Status::Paused); break;
+		case CRadioPlayer::State::Stopped: m_media.SetStatus(CMediaSession::Status::Stopped); break;
+	}
 }
 
 void CMainWnd::RefreshQueueList()
@@ -650,27 +692,41 @@ void CMainWnd::RefreshQueueList()
 	if (!m_queue.m_hWnd) {
 		return;
 	}
+	// Only the changed tail is rewritten, so the user's scroll position and
+	// selection survive the queue growing while they look at it.
 	const auto& queue = m_player.Queue();
 	const int current = m_player.CurrentIndex();
-	const int top = m_queue.GetTopIndex();
-	m_queue.SetRedraw(FALSE);
-	m_queue.ResetContent();
-	for (const auto& item : queue) {
-		CStringW s = item.label;
-		if (!item.ref.albumTitle.IsEmpty()) {
-			s += L"   \x2014   " + item.ref.albumTitle;
+	size_t same = 0;
+	while (same < queue.size() && same < m_listedIds.size() && queue[same].id == m_listedIds[same]) {
+		same++;
+	}
+	if (same != queue.size() || same != m_listedIds.size()) {
+		const int top = m_queue.GetTopIndex();
+		const int sel = m_queue.GetCurSel();
+		const UINT64 selId = (sel >= 0 && sel < static_cast<int>(m_listedIds.size())) ? m_listedIds[static_cast<size_t>(sel)] : 0;
+		m_queue.SetRedraw(FALSE);
+		for (int i = m_queue.GetCount() - 1; i >= static_cast<int>(same); i--) {
+			m_queue.DeleteString(static_cast<UINT>(i));
 		}
-		m_queue.AddString(s);
+		m_listedIds.resize(same);
+		for (size_t i = same; i < queue.size(); i++) {
+			m_queue.AddString(QueueText(queue[i]));
+			m_listedIds.push_back(queue[i].id);
+		}
+		if (selId) {
+			m_queue.SetCurSel(m_player.FindById(selId));
+		}
+		if (top >= 0 && top < m_queue.GetCount()) {
+			m_queue.SetTopIndex(top);
+		}
+		m_queue.SetRedraw(TRUE);
 	}
 	if (current != m_listedCurrent && current >= 0) {
 		// a new track: scroll so it shows near the top
 		m_queue.SetTopIndex(std::max(0, current - 1));
-	} else if (top >= 0 && top < m_queue.GetCount()) {
-		m_queue.SetTopIndex(top);
 	}
 	m_listedCurrent = current;
-	m_queue.SetRedraw(TRUE);
-	m_queue.Invalidate();
+	m_queue.Invalidate(FALSE);
 }
 
 void CMainWnd::UpdateTitle()
@@ -685,12 +741,11 @@ void CMainWnd::ShowAlbumCover(const CStringW& albumUrl, const CStringW& coverPat
 	if (!cur || cur->ref.albumUrl.CompareNoCase(albumUrl) != 0) {
 		return; // a cover for an album that is not playing (any more)
 	}
-	m_coverAlbum = albumUrl;
 	if (coverPath.IsEmpty()) {
 		m_cover.Reset();
 	} else if (coverPath.CompareNoCase(m_cover.Path()) != 0) {
 		if (!m_cover.Load(coverPath)) {
-			KHInsider::DebugLog(L"cover: could not decode " + coverPath);
+			KHLog::Format(L"cover: could not decode %s", coverPath.GetString());
 		}
 	}
 	if (m_coverScaled) {
@@ -699,6 +754,7 @@ void CMainWnd::ShowAlbumCover(const CStringW& albumUrl, const CStringW& coverPat
 	}
 	InvalidateRect(m_rcCover, FALSE);
 	UpdateIconic();
+	UpdateMediaTrack();
 	PruneCovers(false);
 }
 
@@ -827,11 +883,7 @@ void CMainWnd::OnDestroy()
 {
 	SaveState();
 	KillTimer(kUiTimer);
-	if (m_hotkeys) {
-		for (int id = HK_PLAYPAUSE; id <= HK_STOP; id++) {
-			UnregisterHotKey(m_hWnd, id);
-		}
-	}
+	m_media.Shutdown();
 	m_player.Shutdown();
 	if (m_coverScaled) {
 		DeleteObject(m_coverScaled);

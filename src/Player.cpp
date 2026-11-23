@@ -13,7 +13,9 @@
 #include <cmath>
 
 #include "Player.h"
-#include "KHInsider.h"
+#include "AudioCache.h"
+#include "KHParse.h"
+#include "Log.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -26,11 +28,12 @@ namespace
 	constexpr ULONGLONG kStallTimeoutMs = 60000;  // playing but no progress this long -> skip
 	constexpr int kMaxErrorsInRow = 10;           // stop instead of skipping forever
 
-	// Forwards engine events (worker thread) to the UI thread.
+	// Forwards engine events (worker thread) to the UI thread, tagged with the
+	// load they belong to: wParam = event | (load generation << 16).
 	class EngineNotify : public IMFMediaEngineNotify
 	{
 	public:
-		explicit EngineNotify(HWND hwnd) : m_hwnd(hwnd) {}
+		EngineNotify(HWND hwnd, std::shared_ptr<std::atomic<UINT>> gen) : m_hwnd(hwnd), m_gen(std::move(gen)) {}
 
 		STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
 		{
@@ -55,16 +58,15 @@ namespace
 			return n;
 		}
 
-		STDMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD param2) override
+		STDMETHODIMP EventNotify(DWORD event, DWORD_PTR, DWORD) override
 		{
 			switch (event) {
 				case MF_MEDIA_ENGINE_EVENT_PLAYING:
 				case MF_MEDIA_ENGINE_EVENT_ENDED:
 				case MF_MEDIA_ENGINE_EVENT_ERROR:
-				case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
-				case MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE: {
-					const LPARAM packed = static_cast<LPARAM>((static_cast<ULONGLONG>(param2) << 32) | static_cast<DWORD>(param1));
-					PostMessageW(m_hwnd, WM_KHRADIO_PLAYER_EVENT, event, packed);
+				case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA: {
+					const WPARAM packed = (static_cast<WPARAM>(m_gen->load()) << 16) | (event & 0xFFFF);
+					PostMessageW(m_hwnd, WM_KHRADIO_PLAYER_EVENT, packed, 0);
 					break;
 				}
 			}
@@ -72,9 +74,10 @@ namespace
 		}
 
 	private:
-		~EngineNotify() = default;
+		virtual ~EngineNotify() = default;
 		LONG m_ref = 1;
 		HWND m_hwnd;
+		std::shared_ptr<std::atomic<UINT>> m_gen;
 	};
 
 	CStringW EngineErrorText(USHORT code, HRESULT hr)
@@ -84,12 +87,19 @@ namespace
 			case MF_MEDIA_ENGINE_ERR_ABORTED: what = L"aborted"; break;
 			case MF_MEDIA_ENGINE_ERR_NETWORK: what = L"network error"; break;
 			case MF_MEDIA_ENGINE_ERR_DECODE: what = L"decode error"; break;
-			case MF_MEDIA_ENGINE_ERR_SRC_NOT_SUPPORTED: what = L"format not supported (no decoder?)"; break;
+			case MF_MEDIA_ENGINE_ERR_SRC_NOT_SUPPORTED: what = L"format not supported (no decoder installed?)"; break;
 			case MF_MEDIA_ENGINE_ERR_ENCRYPTED: what = L"encrypted"; break;
 		}
 		CStringW text;
 		text.Format(L"%s (0x%08lX)", what, static_cast<unsigned long>(hr));
 		return text;
+	}
+
+	// Ogg is decoded to a WAV in the app's cache before it plays; everything
+	// else streams from its address.
+	QueueItem::Prepare PrepareFor(const CStringW& audioUrl)
+	{
+		return KHInsider::AudioFormatOf(audioUrl) == KHInsider::AudioFormat::Ogg ? QueueItem::Prepare::DecodeOgg : QueueItem::Prepare::None;
 	}
 }
 
@@ -102,14 +112,14 @@ bool CRadioPlayer::Initialize(HWND notifyWnd, IPlayerListener* listener)
 {
 	m_listener = listener;
 	if (FAILED(MFStartup(MF_VERSION))) {
-		KHInsider::DebugLog(L"player: MFStartup failed");
+		KHLog::Line(L"player: MFStartup failed");
 		return false;
 	}
 	m_mfStarted = true;
 
 	ComPtr<IMFMediaEngineClassFactory> factory;
 	ComPtr<IMFAttributes> attributes;
-	EngineNotify* notify = new EngineNotify(notifyWnd);
+	EngineNotify* notify = new EngineNotify(notifyWnd, m_loadGen);
 	HRESULT hr = CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
 	if (SUCCEEDED(hr)) {
 		hr = MFCreateAttributes(&attributes, 2);
@@ -123,18 +133,21 @@ bool CRadioPlayer::Initialize(HWND notifyWnd, IPlayerListener* listener)
 	}
 	notify->Release();
 	if (FAILED(hr)) {
-		CStringW log;
-		log.Format(L"player: could not create the Media Foundation engine (0x%08lX)", static_cast<unsigned long>(hr));
-		KHInsider::DebugLog(log);
+		KHLog::Format(L"player: could not create the Media Foundation engine (0x%08lX)", static_cast<unsigned long>(hr));
 		m_engine.Reset();
 		return false;
 	}
 	m_engine->SetVolume(m_volume);
+	if (FAILED(m_engine.As(&m_engineEx))) {
+		KHLog::Line(L"player: IMFMediaEngineEx is missing - tracks from the audio cache can't play");
+	}
 	return true;
 }
 
 void CRadioPlayer::Shutdown()
 {
+	++(*m_loadGen);
+	m_engineEx.Reset();
 	if (m_engine) {
 		m_engine->Shutdown();
 		m_engine.Reset();
@@ -148,7 +161,22 @@ void CRadioPlayer::Shutdown()
 
 const QueueItem* CRadioPlayer::Current() const
 {
-	return (m_index >= 0 && m_index < static_cast<int>(m_queue.size())) ? &m_queue[m_index] : nullptr;
+	return (m_index >= 0 && m_index < static_cast<int>(m_queue.size())) ? &m_queue[static_cast<size_t>(m_index)] : nullptr;
+}
+
+QueueItem* CRadioPlayer::Item(int index)
+{
+	return (index >= 0 && index < static_cast<int>(m_queue.size())) ? &m_queue[static_cast<size_t>(index)] : nullptr;
+}
+
+int CRadioPlayer::FindById(UINT64 id) const
+{
+	for (size_t i = 0; i < m_queue.size(); i++) {
+		if (m_queue[i].id == id) {
+			return static_cast<int>(i);
+		}
+	}
+	return -1;
 }
 
 void CRadioPlayer::SetState(State state)
@@ -161,18 +189,26 @@ void CRadioPlayer::SetState(State state)
 	}
 }
 
+void CRadioPlayer::NotifyQueue()
+{
+	if (m_listener) {
+		m_listener->OnQueueChanged();
+	}
+}
+
 void CRadioPlayer::Clear()
 {
+	++(*m_loadGen);
 	if (m_engine) {
 		m_engine->Pause();
 	}
 	m_queue.clear();
 	m_index = -1;
 	m_started = false;
+	m_waiting = false;
+	m_sourceSet = false;
 	SetState(State::Stopped);
-	if (m_listener) {
-		m_listener->OnQueueChanged();
-	}
+	NotifyQueue();
 }
 
 int CRadioPlayer::Append(const QueueItem& item)
@@ -183,9 +219,15 @@ int CRadioPlayer::Append(const QueueItem& item)
 		m_index -= 250;
 	}
 	m_queue.push_back(item);
-	if (m_listener) {
-		m_listener->OnQueueChanged();
+	QueueItem& added = m_queue.back();
+	if (!added.id) {
+		added.id = NewQueueItemId();
 	}
+	// a local file only ever comes from Prepared(), never with an appended item
+	added.localPath.Empty();
+	added.triedLocal = false;
+	added.prepare = PrepareFor(added.audioUrl);
+	NotifyQueue();
 	return static_cast<int>(m_queue.size()) - 1;
 }
 
@@ -198,24 +240,142 @@ void CRadioPlayer::UpdateAlbumCover(const CStringW& albumUrl, const CStringW& co
 	}
 }
 
+void CRadioPlayer::Resolve(int index, const CStringW& audioUrl)
+{
+	QueueItem* item = Item(index);
+	if (!item || audioUrl.IsEmpty()) {
+		return;
+	}
+	item->audioUrl = audioUrl;
+	item->prepare = PrepareFor(audioUrl);
+	item->localPath.Empty();
+	if (index == m_index && m_waiting) {
+		if (m_state == State::Paused) {
+			m_waiting = false; // starts when the user presses play
+		} else {
+			Load(index, m_pendingSeek, m_resumed);
+		}
+	}
+}
+
+void CRadioPlayer::Prepared(int index, const CStringW& localPath)
+{
+	QueueItem* item = Item(index);
+	if (!item || !item->IsResolved()) {
+		return;
+	}
+	if (localPath.IsEmpty()) {
+		item->prepare = QueueItem::Prepare::None; // play the address itself
+	} else if (!KHAudioCache::IsCacheFile(localPath)) {
+		KHLog::Format(L"player: refused a local file outside the audio cache: %s", localPath.GetString());
+		return;
+	}
+	item->localPath = localPath;
+	if (index == m_index && m_waiting) {
+		if (m_state == State::Paused) {
+			m_waiting = false; // starts when the user presses play
+		} else {
+			Load(index, m_pendingSeek, m_resumed);
+		}
+	}
+}
+
+void CRadioPlayer::Remove(int index)
+{
+	if (index < 0 || index >= static_cast<int>(m_queue.size())) {
+		return;
+	}
+	m_queue.erase(m_queue.begin() + index);
+	if (index < m_index) {
+		m_index--;
+		NotifyQueue();
+		return;
+	}
+	if (index > m_index) {
+		NotifyQueue();
+		return;
+	}
+	// the current item went away: move on to what is now at its place
+	++(*m_loadGen);
+	m_started = false;
+	m_sourceSet = false;
+	m_waiting = false;
+	if (m_engine) {
+		m_engine->Pause();
+	}
+	const bool wasRunning = m_state == State::Loading || m_state == State::Playing;
+	if (m_index >= static_cast<int>(m_queue.size())) {
+		m_index = static_cast<int>(m_queue.size()) - 1;
+		NotifyQueue();
+		SetState(State::Stopped);
+		if (wasRunning && m_listener) {
+			m_listener->OnQueueEnded();
+		}
+		return;
+	}
+	if (wasRunning) {
+		Load(m_index, 0.0, false);
+	} else {
+		NotifyQueue();
+	}
+}
+
 void CRadioPlayer::PlayIndex(int index, double startSec, bool resumed)
+{
+	m_errorsInRow = 0; // a user's choice starts a fresh count
+	Load(index, startSec, resumed);
+}
+
+void CRadioPlayer::Load(int index, double startSec, bool resumed)
 {
 	if (!m_engine || index < 0 || index >= static_cast<int>(m_queue.size())) {
 		return;
 	}
+	++(*m_loadGen); // events still queued for the previous track are ignored
 	m_index = index;
 	m_started = false;
+	m_sourceSet = false;
 	m_resumed = resumed;
 	m_pendingSeek = startSec > 1.0 ? startSec : 0.0;
-	m_loadTick = GetTickCount64();
 	m_lastPos = -1.0;
-	m_lastProgressTick = m_loadTick;
 
-	BSTR url = SysAllocString(m_queue[index].audioUrl);
-	const HRESULT hr = m_engine->SetSource(url);
-	SysFreeString(url);
-	if (m_listener) {
-		m_listener->OnQueueChanged();
+	QueueItem& item = m_queue[static_cast<size_t>(index)];
+	if (!item.localPath.IsEmpty() && GetFileAttributesW(item.localPath) == INVALID_FILE_ATTRIBUTES) {
+		item.localPath.Empty(); // the cache let it go (an earlier track): prepare it again
+	}
+	if (!item.IsResolved() || item.NeedsPrepare()) {
+		// no audio address yet, or its file is still being prepared
+		m_engine->Pause();
+		m_waiting = true;
+		SetState(State::Loading);
+		NotifyQueue();
+		if (m_listener) {
+			m_listener->OnNeedResolve(index);
+		}
+		return;
+	}
+	m_waiting = false;
+	m_loadTick = GetTickCount64();
+	m_lastProgressTick = m_loadTick;
+	NotifyQueue();
+
+	HRESULT hr = S_OK;
+	if (!item.localPath.IsEmpty()) {
+		// Only files the app prepared in its own cache folder; queue.json and
+		// scraped pages can't name a local file (localPath is never saved).
+		if (!KHAudioCache::IsCacheFile(item.localPath)) {
+			Fail(L"the prepared file is not in KH Radio's audio cache");
+			return;
+		}
+		hr = OpenLocal(item.localPath);
+	} else {
+		if (!KHInsider::IsAllowedMediaUrl(item.audioUrl)) {
+			Fail(L"the audio address is not on KHInsider's servers");
+			return;
+		}
+		BSTR url = SysAllocString(item.audioUrl);
+		hr = url ? m_engine->SetSource(url) : E_OUTOFMEMORY;
+		SysFreeString(url);
 	}
 	if (FAILED(hr)) {
 		CStringW msg;
@@ -223,8 +383,45 @@ void CRadioPlayer::PlayIndex(int index, double startSec, bool resumed)
 		Fail(msg);
 		return;
 	}
+	m_sourceSet = true;
 	SetState(State::Loading);
 	m_engine->Play();
+}
+
+HRESULT CRadioPlayer::OpenLocal(const CStringW& path)
+{
+	if (!m_engineEx) {
+		return E_NOINTERFACE;
+	}
+	ComPtr<IMFByteStream> stream;
+	HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path, &stream);
+	if (FAILED(hr)) {
+		return hr;
+	}
+	BSTR hint = SysAllocString(path); // its extension (.wav / .m4a) picks the format
+	hr = hint ? m_engineEx->SetSourceFromByteStream(stream.Get(), hint) : E_OUTOFMEMORY;
+	SysFreeString(hint);
+	return hr;
+}
+
+bool CRadioPlayer::TryLocalCopy(const CStringW& why)
+{
+	QueueItem* item = Item(m_index);
+	if (!item || item->prepare != QueueItem::Prepare::None || item->triedLocal || !item->localPath.IsEmpty()
+			|| KHInsider::AudioFormatOf(item->audioUrl) != KHInsider::AudioFormat::M4a) {
+		return false;
+	}
+	// A progressive m4a can fail to stream (e.g. its index at the end of a file
+	// the server won't serve in ranges): fetch the whole file and play that.
+	item->triedLocal = true;
+	item->prepare = QueueItem::Prepare::Download;
+	KHLog::Format(L"player: the m4a stream failed (%s) - downloading it to play from the cache", why.GetString());
+	const double at = m_started ? Position() : m_pendingSeek;
+	if (m_engine) {
+		m_engine->Pause();
+	}
+	Load(m_index, at, m_resumed);
+	return true;
 }
 
 void CRadioPlayer::Play()
@@ -233,6 +430,11 @@ void CRadioPlayer::Play()
 		return;
 	}
 	if (m_state == State::Paused) {
+		m_errorsInRow = 0;
+		if (!m_sourceSet) {
+			Load(m_index, m_pendingSeek, m_resumed); // never opened (or waiting): open it now
+			return;
+		}
 		m_engine->Play();
 		if (m_started) {
 			SetState(State::Playing);
@@ -264,8 +466,9 @@ void CRadioPlayer::TogglePause()
 
 void CRadioPlayer::Next()
 {
+	m_errorsInRow = 0;
 	if (m_index + 1 < static_cast<int>(m_queue.size())) {
-		PlayIndex(m_index + 1);
+		Load(m_index + 1, 0.0, false);
 	} else {
 		// at the end: let the radio fetch more instead of stopping silently
 		Stop();
@@ -277,10 +480,11 @@ void CRadioPlayer::Next()
 
 void CRadioPlayer::Prev()
 {
+	m_errorsInRow = 0;
 	if (Position() > 3.0 || m_index <= 0) {
 		Seek(0.0);
 	} else {
-		PlayIndex(m_index - 1);
+		Load(m_index - 1, 0.0, false);
 	}
 }
 
@@ -307,7 +511,7 @@ void CRadioPlayer::Seek(double seconds)
 
 double CRadioPlayer::Position() const
 {
-	if (!m_engine || m_index < 0) {
+	if (!m_engine || m_index < 0 || !m_sourceSet) {
 		return 0.0;
 	}
 	const double t = m_engine->GetCurrentTime();
@@ -316,7 +520,7 @@ double CRadioPlayer::Position() const
 
 double CRadioPlayer::Duration() const
 {
-	if (!m_engine || m_index < 0) {
+	if (!m_engine || m_index < 0 || !m_sourceSet) {
 		return 0.0;
 	}
 	const double d = m_engine->GetDuration();
@@ -334,8 +538,9 @@ void CRadioPlayer::SetVolume(double volume)
 void CRadioPlayer::Advance()
 {
 	if (m_index + 1 < static_cast<int>(m_queue.size())) {
-		PlayIndex(m_index + 1);
+		Load(m_index + 1, 0.0, false);
 	} else {
+		++(*m_loadGen);
 		SetState(State::Stopped);
 		if (m_listener) {
 			m_listener->OnQueueEnded();
@@ -346,33 +551,36 @@ void CRadioPlayer::Advance()
 void CRadioPlayer::Fail(const CStringW& message)
 {
 	const int failed = m_index;
-	CStringW log;
-	log.Format(L"player: skipping item %d (%s): %s", failed,
+	KHLog::Format(L"player: skipping item %d (%s): %s", failed,
 		Current() ? Current()->audioUrl.GetString() : L"?", message.GetString());
-	KHInsider::DebugLog(log);
 	if (m_listener) {
 		m_listener->OnPlayerError(failed, message);
-	}
-	if (++m_errorsInRow >= kMaxErrorsInRow) {
-		KHInsider::DebugLog(L"player: too many failures in a row - stopping");
-		Stop();
-		if (m_listener) {
-			m_listener->OnPlayerError(-1, L"Too many tracks failed in a row - playback stopped.");
-		}
-		return;
 	}
 	if (m_engine) {
 		m_engine->Pause();
 	}
+	if (++m_errorsInRow >= kMaxErrorsInRow) {
+		KHLog::Line(L"player: too many failures in a row - stopping");
+		++(*m_loadGen);
+		Stop();
+		if (m_listener) {
+			m_listener->OnPlayerError(-1, L"Too many tracks failed in a row - playback stopped. Press play to try again.");
+		}
+		return;
+	}
 	Advance();
 }
 
-LRESULT CRadioPlayer::HandleEvent(WPARAM wParam, LPARAM lParam)
+LRESULT CRadioPlayer::HandleEvent(WPARAM wParam, LPARAM)
 {
 	if (!m_engine || m_index < 0) {
 		return 0;
 	}
-	const DWORD event = static_cast<DWORD>(wParam);
+	const UINT gen = static_cast<UINT>(wParam >> 16);
+	if (gen != (m_loadGen->load() & 0xFFFFFFFFu) || !m_sourceSet) {
+		return 0; // from a track that was already left
+	}
+	const DWORD event = static_cast<DWORD>(wParam & 0xFFFF);
 	switch (event) {
 		case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
 			if (m_pendingSeek > 0.0) {
@@ -398,14 +606,10 @@ LRESULT CRadioPlayer::HandleEvent(WPARAM wParam, LPARAM lParam)
 			break;
 		case MF_MEDIA_ENGINE_EVENT_ENDED:
 			if (m_state == State::Playing && m_engine->IsEnded()) {
-				if (m_listener) {
-					m_listener->OnTrackEnded(m_index);
-				}
 				Advance();
 			}
 			break;
 		case MF_MEDIA_ENGINE_EVENT_ERROR: {
-			// A stale error from the previous source finds no error on the new one.
 			ComPtr<IMFMediaError> error;
 			if (FAILED(m_engine->GetError(&error)) || !error) {
 				break;
@@ -415,8 +619,10 @@ LRESULT CRadioPlayer::HandleEvent(WPARAM wParam, LPARAM lParam)
 			if (code == MF_MEDIA_ENGINE_ERR_NOERROR || code == MF_MEDIA_ENGINE_ERR_ABORTED) {
 				break;
 			}
-			UNREFERENCED_PARAMETER(lParam);
-			Fail(EngineErrorText(code, hr));
+			const CStringW text = EngineErrorText(code, hr);
+			if (!TryLocalCopy(text)) {
+				Fail(text);
+			}
 			break;
 		}
 	}
@@ -425,14 +631,17 @@ LRESULT CRadioPlayer::HandleEvent(WPARAM wParam, LPARAM lParam)
 
 void CRadioPlayer::Tick()
 {
-	if (!m_engine || m_index < 0) {
-		return;
+	if (!m_engine || m_index < 0 || m_waiting) {
+		return; // waiting for an audio URL: the radio dialog watches that
 	}
 	const ULONGLONG now = GetTickCount64();
 	if (m_state == State::Loading && now - m_loadTick > kLoadTimeoutMs) {
-		Fail(L"timed out opening the track");
+		if (!TryLocalCopy(L"timed out opening it")) {
+			Fail(L"timed out opening the track");
+		}
 		return;
 	}
+
 	if (m_state == State::Playing) {
 		const double pos = Position();
 		if (pos != m_lastPos) {
