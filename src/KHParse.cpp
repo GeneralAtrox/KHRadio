@@ -332,30 +332,229 @@ namespace KHInsider
 		return body;
 	}
 
-	// Title-only spoken check: drama/voice keywords (English + Japanese). Used for
-	// individual track names and for whole album titles - a "...Mini Drama" or
-	// "Drama CD" / "Voice Collection" album is entirely spoken.
-	bool IsSpokenTitle(const CStringW& title)
+	namespace {
+		// A letter or digit of a Latin-script word: the edge of a whole-word match.
+		bool IsLatinWordChar(wchar_t c)
+		{
+			return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')
+				|| (c >= 0xC0 && c <= 0x24F && c != 0xD7 && c != 0xF7) || c == L'\'';
+		}
+
+		bool IsDigitW(wchar_t c)
+		{
+			return (c >= L'0' && c <= L'9') || (c >= 0xFF10 && c <= 0xFF19);
+		}
+
+		// Kanji numerals used in episode numbers (第一話, 第十二話).
+		bool IsKanjiDigit(wchar_t c)
+		{
+			static const wchar_t digits[] = L"一二三四五六七八九十百零〇";
+			return wcschr(digits, c) != nullptr && c != 0;
+		}
+
+		// 'phrase' (lower case) as whole words somewhere in 'lower'.
+		bool HasWords(const CStringW& lower, LPCWSTR phrase)
+		{
+			const int n = static_cast<int>(wcslen(phrase));
+			for (int at = lower.Find(phrase); at >= 0; at = lower.Find(phrase, at + 1)) {
+				const bool startOk = at == 0 || !IsLatinWordChar(lower[at - 1]);
+				const bool endOk = at + n >= lower.GetLength() || !IsLatinWordChar(lower[at + n]);
+				if (startOk && endOk) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		// ドラマ as its own word: not ドラマチック / ドラマティック / ドラマー.
+		bool HasJapaneseDrama(const CStringW& s)
+		{
+			for (int at = s.Find(L"ドラマ"); at >= 0; at = s.Find(L"ドラマ", at + 1)) {
+				const wchar_t next = at + 3 < s.GetLength() ? s[at + 3] : 0;
+				if (next != L'チ' && next != L'テ' && next != L'ー') {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		// 第N話 / 第N章 (N in digits or kanji numerals).
+		bool HasNumbered(const CStringW& s, wchar_t unit)
+		{
+			for (int at = s.Find(L'第'); at >= 0; at = s.Find(L'第', at + 1)) {
+				int i = at + 1;
+				while (i < s.GetLength() && (IsDigitW(s[i]) || IsKanjiDigit(s[i]))) {
+					i++;
+				}
+				if (i > at + 1 && i < s.GetLength() && s[i] == unit) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		// Lower-case Latin words of the title, in order.
+		std::vector<CStringW> LatinWords(const CStringW& lower)
+		{
+			std::vector<CStringW> words;
+			CStringW cur;
+			for (int i = 0; i <= lower.GetLength(); i++) {
+				const wchar_t c = i < lower.GetLength() ? lower[i] : 0;
+				if (c && IsLatinWordChar(c) && c != L'\'') {
+					cur += c;
+				} else if (!cur.IsEmpty()) {
+					words.push_back(cur);
+					cur.Empty();
+				}
+			}
+			return words;
+		}
+
+		// "Aerith Voice" / "Kairi's Voice": a short title naming whose voice it is.
+		// Not "Voice of the Deep", "Hall of Voices", "Inner Voice", "Silent Voice".
+		bool IsNamedVoiceTitle(const CStringW& lower)
+		{
+			const std::vector<CStringW> w = LatinWords(lower);
+			if (w.size() < 2 || w.size() > 4 || w.back() != L"voice") {
+				return false;
+			}
+			static const LPCWSTR notNames[] = {
+				L"the", L"a", L"an", L"of", L"my", L"your", L"his", L"her", L"our", L"their", L"its",
+				L"inner", L"silent", L"this", L"that", L"one", L"no", L"same", L"distant", L"lost",
+				L"angel", L"angels", L"heavenly", L"sweet", L"gentle", L"crystal", L"wind", L"ocean",
+				L"sea", L"forest", L"heart", L"soul", L"spirit", L"divine", L"sacred", L"secret",
+				L"true", L"last", L"final", L"first", L"new", L"another", L"hidden", L"echoing",
+			};
+			const CStringW& before = w[w.size() - 2];
+			for (const auto s : notNames) {
+				if (before == s) {
+					return false;
+				}
+			}
+			return true;
+		}
+	}
+
+	TitleCue SpokenTitleCue(const CStringW& title, CStringW* matched)
 	{
 		CStringW lower = title;
 		lower.MakeLower();
-		static const LPCWSTR spokenWords[] = {
-			L"dialogue", L"dialog", L"voice", L"narration", L"narrator", L"monologue",
-			L"interview", L"commentary", L"drama cd", L"mini drama", L"audio drama",
-			L"radio drama", L"drama disc", L"drama track", L"voice drama", L"vocal drama",
-			L"voice collection", L"skit", L"cutscene", L"cut scene", L"voice clip", L"voices",
-			L"ボイス",                   // voice (boisu)
-			L"セリフ",                   // serifu (spoken lines)
-			L"ドラマ",                   // drama
-			L"ナレーション", // narration
-			L"会話",                         // kaiwa (conversation)
+		auto hit = [&](LPCWSTR what, TitleCue cue) {
+			if (matched) {
+				*matched = what;
+			}
+			return cue;
 		};
-		for (const auto w : spokenWords) {
-			if (lower.Find(w) != -1) {
+
+		// Strong: the title says outright that the track is a drama or voice recording.
+		static const LPCWSTR strongWords[] = {
+			L"drama cd", L"drama disc", L"drama track", L"drama part", L"mini drama", L"audio drama",
+			L"radio drama", L"voice drama", L"vocal drama", L"sound drama", L"cd drama",
+			L"voice collection", L"voice clip", L"voice clips", L"voice sample", L"voice samples",
+			L"cast comment", L"cast comments", L"cast talk", L"audio commentary", L"djcd", L"free talk",
+		};
+		for (const auto w : strongWords) {
+			if (HasWords(lower, w)) {
+				return hit(w, TitleCue::Strong);
+			}
+		}
+		static const LPCWSTR strongJa[] = {
+			L"ドラマcd", L"ドラマｃｄ", L"ミニドラマ", L"ボイスドラマ", L"ヴォイスドラマ", L"ボイスコレクション",
+			L"ヴォイスコレクション", L"キャストコメント", L"ボイス集", L"ヴォイス集", L"セリフ集", L"台詞集",
+		};
+		for (const auto w : strongJa) {
+			if (lower.Find(w) >= 0) {
+				return hit(w, TitleCue::Strong);
+			}
+		}
+
+		// Weak: common in drama and cutscene tracks, but also in some music titles
+		// ("Message", "Talk", a "Prologue" cue), so the audio must agree.
+		static const LPCWSTR weakWords[] = {
+			L"drama", L"cutscene", L"cutscenes", L"cut scene", L"cut scenes", L"message", L"talk",
+			L"narration", L"narrator", L"dialogue", L"dialog", L"monologue", L"skit", L"skits",
+			L"commentary", L"interview", L"with voice",
+		};
+		for (const auto w : weakWords) {
+			if (HasWords(lower, w)) {
+				return hit(w, TitleCue::Weak);
+			}
+		}
+		if (IsNamedVoiceTitle(lower)) {
+			return hit(L"<name> voice", TitleCue::Weak);
+		}
+		// "Scene 12 ..." at the start, or "#scene": numbered cutscenes
+		{
+			CStringW t = lower;
+			t.TrimLeft();
+			if (t.Find(L"#scene") >= 0) {
+				return hit(L"#scene", TitleCue::Weak);
+			}
+			if (t.Left(5) == L"scene") {
+				int i = 5;
+				while (i < t.GetLength() && (t[i] == L' ' || t[i] == L'.' || t[i] == L'_' || t[i] == L'-')) {
+					i++;
+				}
+				if (i < t.GetLength() && IsDigitW(t[i])) {
+					return hit(L"scene N", TitleCue::Weak);
+				}
+			}
+		}
+		if (HasJapaneseDrama(lower)) {
+			return hit(L"ドラマ", TitleCue::Weak);
+		}
+		if (HasNumbered(lower, L'話')) {
+			return hit(L"第N話", TitleCue::Weak);
+		}
+		if (HasNumbered(lower, L'章')) {
+			return hit(L"第N章", TitleCue::Weak);
+		}
+		static const LPCWSTR weakJa[] = {
+			L"ボイス", L"ヴォイス", L"セリフ", L"台詞", L"ナレーション", L"会話", L"メッセージ", L"トーク",
+			L"コメント", L"朗読", L"インタビュー", L"おまけ",
+		};
+		for (const auto w : weakJa) {
+			if (lower.Find(w) >= 0) {
+				return hit(w, TitleCue::Weak);
+			}
+		}
+		return TitleCue::None;
+	}
+
+	// An album title that says the whole album is spoken: a drama CD, a voice
+	// collection, a radio show CD.
+	bool IsSpokenTitle(const CStringW& title, CStringW* matched)
+	{
+		CStringW m;
+		if (SpokenTitleCue(title, &m) == TitleCue::Strong) {
+			if (matched) {
+				*matched = m;
+			}
+			return true;
+		}
+		CStringW lower = title;
+		lower.MakeLower();
+		static const LPCWSTR albumWords[] = { L"drama", L"mini story", L"radio cd", L"djcd" };
+		for (const auto w : albumWords) {
+			if (HasWords(lower, w)) {
+				if (matched) {
+					*matched = w;
+				}
 				return true;
 			}
 		}
+		if (HasJapaneseDrama(lower)) {
+			if (matched) {
+				*matched = L"ドラマ";
+			}
+			return true;
+		}
 		return false;
+	}
+
+	bool IsShortTrack(int durationSec, int minSec)
+	{
+		return durationSec > 0 && minSec > 0 && durationSec < minSec;
 	}
 
 	size_t Id3v2TagSize(const unsigned char* data, size_t len)

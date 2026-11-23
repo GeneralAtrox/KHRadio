@@ -78,9 +78,22 @@ namespace KHInsider
 	// option values of the site's form ("type[]", "year[]", "category[]").
 	CStringA BuildRandomAlbumForm(const std::vector<int>& types, const std::vector<int>& years, const std::vector<int>& platforms);
 
-	// True if a title (a track name or a whole album title) contains drama/voice
-	// keywords - lets the radio skip drama-CD / voice albums by title.
-	bool IsSpokenTitle(const CStringW& title);
+	// How strongly a track title says the track is talking (a drama, cutscene or
+	// voice track). Whole words only: "drama" matches "Drama Part 2" but not
+	// "Dramatic", ドラマ doesn't match ドラマチック, "skit" doesn't match "Skitchin'".
+	// Strong ("Drama CD", "Voice Collection", ミニドラマ) is enough on its own; Weak
+	// ("Message", "Talk", "Scene 3", 第2話, セリフ) needs the audio to agree.
+	// 'matched' receives the phrase that matched, for the log.
+	enum class TitleCue { None, Weak, Strong };
+	TitleCue SpokenTitleCue(const CStringW& title, CStringW* matched = nullptr);
+
+	// True if an album title says the whole album is spoken (a drama CD, a voice
+	// collection, a radio show CD): the radio picks another album.
+	bool IsSpokenTitle(const CStringW& title, CStringW* matched = nullptr);
+
+	// Shorter than the minimum length. An unknown duration (0) is never short, and
+	// minSec 0 turns the check off.
+	bool IsShortTrack(int durationSec, int minSec);
 
 	// Size of a leading ID3v2 tag (header, body and footer), or 0 if there is none.
 	size_t Id3v2TagSize(const unsigned char* data, size_t len);

@@ -30,13 +30,57 @@ extensions or autoplay handlers and ignores command-line arguments.
 - Track audio is looked up a few tracks ahead of the one playing, so a new album
   starts after one page load instead of one per track.
 
+## Skipping drama and cutscene tracks
+
+Many game soundtracks, Japanese ones most of all, carry tracks that are people
+talking: drama-CD episodes, cutscene dialogue, voice-actor messages, narration.
+With **Filter spoken / short / silent tracks** ticked, KH Radio passes over them.
+
+- **Album titles** that say the whole album is spoken ("Drama CD", "Voice
+  Collection", "DJCD", "Mini Story", ドラマCD, ミニドラマ...) are rerolled in random mode.
+- **Track titles** are matched as whole words, never inside other words: "Drama CD",
+  "Mini Drama", "Cast Comment", "Free Talk", ボイスドラマ, セリフ集 are enough on their own.
+  Looser cues ("Drama", "Message", "Talk", "Cutscene", "Scene 3", "#scene", 第2話,
+  メッセージ, トーク, セリフ, ナレーション...) only count when the audio agrees.
+  "Dramatic", ドラマチック, "Hall of Voices" or "Skitchin'" never match.
+- **The audio** is checked a few tracks ahead of playback: two short windows (about
+  256 KB each) are fetched, one after the tag and one from the middle, and decoded.
+  Music holds steady pitches and repeats its beat; talking glides in pitch, pauses
+  between phrases and has no beat. A track counts as talking only when **both**
+  windows sound like it, so a spoken intro followed by music is kept, and so are
+  chiptune, piano, music box, ambient pieces and medleys.
+- **The album decides how sure it has to be.** In an album that has sounded musical,
+  only very clear talking is skipped (one or two odd tracks are kept unless they are
+  plainly speech); in an album that is mostly talking, less is needed; a title cue
+  plus talking-like audio is enough anywhere.
+- **Silent** tracks (both windows silent) and **short** ones are skipped too. Short
+  means under 10 seconds; change it with `"minTrackSeconds"` in `settings.json`
+  (0 turns it off). A track whose length is unknown is never short.
+
+A skipped track stays in the queue as a dimmed row that says why ("sounds like
+talking (drama or cutscene)", "too short", "silent", "title says drama / voice
+track"). Next, previous and the media keys step over it. Right-click it and choose
+**Play anyway** to hear it: it plays at once, and the filter leaves that track alone
+from then on (remembered in `%APPDATA%\KHRadio\keep_tracks.json`). The debug log
+has one line per checked track with every measure and the rule that decided.
+
+**How well it works.** The rule was set on half of a labelled sample of
+game-soundtrack tracks and checked on the other half. The sample deliberately
+included music the 1.3 filter had wrongly skipped; on both halves the new rule
+dropped none of the music, those included. It found about four in five talking tracks overall (most drama-CD and
+radio-show tracks, every drama track titled as one) and about three in five drama or
+cutscene tracks inside otherwise musical soundtracks. What it still misses: talking
+over music or sound effects (cutscenes mixed with score), and short exchanges inside
+an album that has sounded musical, unless the title gives them away. It was tuned to
+keep music first, so it errs on the side of playing talking rather than skipping a song.
+
 ## Sharing
 
 What is copied is plain text: the track and album on the first line and the track's
 own KHInsider page on the second, for example
 
 ```
-Konami Morning Music (Bubble System Startup Theme) — The Konamic Game Freaks
+Opening Theme — Example Game Soundtrack
 https://downloads.khinsider.com/game-soundtracks/album/<album>/<track>
 ```
 
@@ -98,7 +142,8 @@ FLAC or OGG (the first link the page offers among those).
 |------|-------|
 | Settings (filters, volume, window position) | `%APPDATA%\KHRadio\settings.json` |
 | Listening history (and one backup) | `%APPDATA%\KHRadio\khradio_history.json`, `.bak` |
-| Queue and position to resume | `%APPDATA%\KHRadio\queue.json` |
+| Queue and position to resume (skipped rows too) | `%APPDATA%\KHRadio\queue.json` |
+| Tracks the filter leaves alone ("Play anyway") | `%APPDATA%\KHRadio\keep_tracks.json` |
 | Debug log (rotated at 4 MB to `.old`) | `%APPDATA%\KHRadio\khradio_debug.log` |
 | Album covers | `%LOCALAPPDATA%\KHRadio\covers\` |
 | Audio cache (OGG tracks as WAV, fallback M4A downloads; 500 MB at most, emptied at start and exit) | `%LOCALAPPDATA%\KHRadio\cache\` |
@@ -156,9 +201,21 @@ manifest identity and the log line all read it.
 and track page parser on small hand-written pages in `tests\fixtures`, share links
 (building them, finding them in messy pasted text, refusing lookalike hosts), response
 classification, retry delays, the panel layout at 100/150/200% DPI, history files
-(round trip, damaged file, damaged backup, empty list) and the browser session's
-shutdown. `--live` also checks the saved sign-in against the real site, and
+(round trip, damaged file, damaged backup, empty list), the talking-track filter
+(generated audio: tones, a chord with a beat, a music box, a chiptune arpeggio, an
+ambient pad, noise bursts, 4 Hz modulated noise, synthetic speech, silence, a quiet
+intro before loud music; title cues with invented titles; the album context; the
+short-track threshold; skipped rows in the queue and queue.json; the "Play anyway"
+list) and the browser session's shutdown. `--synth` prints every measure of the
+generated audio. `--live` also checks the saved sign-in against the real site, and
 `--login` opens the sign-in window first.
+
+`--eval <list.tsv> <cache folder> <out.csv>` runs the talking-track detector on real
+tracks (one per line: id, label, half, ..., audio address in the 11th column, album
+and track title in the 12th and 13th), fetching two windows per track at a polite
+pace and keeping them in the cache folder, and writes every measure to the CSV.
+`tools\build-remote.ps1 -EvalList/-EvalCache/-EvalOut` runs it on the build machine.
+No list ships with KH Radio.
 
 ## Layout
 

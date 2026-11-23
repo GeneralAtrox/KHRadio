@@ -287,6 +287,8 @@ namespace KHAudioCache
 		bool ok = WriteAll(h, header, sizeof(header));
 		const size_t prefixFrames = static_cast<size_t>(std::max(0.0, prefixSeconds) * rate);
 		out.monoPrefix.reserve(std::min<size_t>(prefixFrames, 48000u * 30u));
+		// the talking check's second window: the middle of the track, when its length is known
+		const unsigned long long midStart = total > 3ull * prefixFrames ? total / 2 : 0;
 		std::vector<short> buf(4096u * static_cast<size_t>(channels));
 		unsigned long long data = 0;
 		while (ok) {
@@ -313,6 +315,16 @@ namespace KHAudioCache
 					? (buf[2 * static_cast<size_t>(i)] + buf[2 * static_cast<size_t>(i) + 1]) * (0.5f / 32768.0f)
 					: buf[static_cast<size_t>(i)] / 32768.0f;
 				out.monoPrefix.push_back(s);
+			}
+			if (midStart) {
+				for (int i = 0; i < n && out.monoMiddle.size() < prefixFrames; i++) {
+					if (out.frames + static_cast<unsigned long long>(i) >= midStart) {
+						const float s = channels == 2
+							? (buf[2 * static_cast<size_t>(i)] + buf[2 * static_cast<size_t>(i) + 1]) * (0.5f / 32768.0f)
+							: buf[static_cast<size_t>(i)] / 32768.0f;
+						out.monoMiddle.push_back(s);
+					}
+				}
 			}
 			data += bytes;
 			out.frames += static_cast<unsigned long long>(n);

@@ -44,7 +44,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>shlwapi.lib;iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>shlwapi.lib;iphlpapi.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Message>Copy the hand-written test pages next to the test exe</Message>
@@ -69,7 +69,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="KHRadioTests.cpp" />
+    <ClCompile Include="..\src\AppData.cpp" />
     <ClCompile Include="..\src\AudioCache.cpp" />
+    <ClCompile Include="..\src\AudioClassify.cpp" />
     <ClCompile Include="..\src\FileUtil.cpp" />
     <ClCompile Include="..\src\History.cpp" />
     <ClCompile Include="..\src\KHParse.cpp" />

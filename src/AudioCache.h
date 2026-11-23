@@ -44,7 +44,8 @@ namespace KHAudioCache
 		int channels = 0;            // in the WAV (1 or 2)
 		int sampleRate = 0;
 		unsigned long long frames = 0;
-		std::vector<float> monoPrefix; // first prefixSeconds as mono float, for the speech check
+		std::vector<float> monoPrefix; // first prefixSeconds as mono float, for the talking check
+		std::vector<float> monoMiddle; // prefixSeconds from the middle (empty if the length is unknown or short)
 	};
 	// Decodes oggPath into wavPath (written as wavPath + ".part", renamed when
 	// complete). Nothing is left behind unless it returns Ok.

@@ -282,6 +282,8 @@ namespace KHRadioData
 		getJsonValue(json, "platforms", s.platforms);
 		getJsonValue(json, "avoidPlayed", s.avoidPlayed);
 		getJsonValue(json, "filterSpoken", s.filterSpoken);
+		getJsonValue(json, "minTrackSeconds", s.minTrackSeconds);
+		s.minTrackSeconds = std::clamp(s.minTrackSeconds, 0, 600);
 		getJsonValue(json, "exclusive", s.exclusive);
 		getJsonValue(json, "volume", s.volume);
 		getJsonValue(json, "saveDebugPages", s.saveDebugPages);
@@ -314,6 +316,7 @@ namespace KHRadioData
 		WriteJsonString(w, "platforms", s.platforms);
 		w.Key("avoidPlayed"); w.Bool(s.avoidPlayed);
 		w.Key("filterSpoken"); w.Bool(s.filterSpoken);
+		w.Key("minTrackSeconds"); w.Int(s.minTrackSeconds);
 		w.Key("exclusive"); w.Bool(s.exclusive);
 		w.Key("volume"); w.Double(s.volume);
 		w.Key("saveDebugPages"); w.Bool(s.saveDebugPages);
@@ -386,8 +389,12 @@ namespace KHRadioData
 
 	SavedQueue LoadQueue()
 	{
+		return LoadQueue(AppDataDir() + L"queue.json");
+	}
+
+	SavedQueue LoadQueue(const CStringW& path)
+	{
 		SavedQueue q;
-		const CStringW path = AppDataDir() + L"queue.json";
 		std::vector<char> data;
 		const auto read = KHFile::ReadAll(path, data);
 		if (read == KHFile::ReadResult::Missing) {
@@ -423,6 +430,13 @@ namespace KHRadioData
 				getJsonValue(v, "albumTitle", item.ref.albumTitle);
 				getJsonValue(v, "coverPath", item.ref.coverPath);
 				getJsonValue(v, "platforms", item.ref.platforms);
+				CStringW skip;
+				getJsonValue(v, "skipped", skip);
+				item.skip = SkipReasonFromKey(skip);
+				getJsonValue(v, "keep", item.keep);
+				if (item.keep) {
+					item.skip = SkipReason::None;
+				}
 				// The file is outside the app's control: only KHInsider addresses are played,
 				// and covers only come from the app's own cache folder.
 				if (!item.audioUrl.IsEmpty() && !KHInsider::IsAllowedMediaUrl(item.audioUrl)) {
@@ -459,6 +473,11 @@ namespace KHRadioData
 
 	bool SaveQueue(const std::vector<QueueItem>& items, int index, double position)
 	{
+		return SaveQueue(AppDataDir() + L"queue.json", items, index, position);
+	}
+
+	bool SaveQueue(const CStringW& path, const std::vector<QueueItem>& items, int index, double position)
+	{
 		// keep a short tail of already-played tracks, not the whole session
 		const size_t first = static_cast<size_t>(std::max(0, index - 50));
 		rapidjson::StringBuffer sb;
@@ -479,12 +498,108 @@ namespace KHRadioData
 			WriteJsonString(w, "albumTitle", item.ref.albumTitle);
 			WriteJsonString(w, "coverPath", item.ref.coverPath);
 			WriteJsonString(w, "platforms", item.ref.platforms);
+			if (item.IsSkipped()) {
+				WriteJsonString(w, "skipped", CStringW(SkipReasonKey(item.skip)));
+			}
+			if (item.keep) {
+				w.Key("keep"); w.Bool(true);
+			}
 			w.EndObject();
 		}
 		w.EndArray();
 		w.EndObject();
-		if (!KHFile::WriteAtomic(AppDataDir() + L"queue.json", sb.GetString(), sb.GetSize())) {
+		if (!KHFile::WriteAtomic(path, sb.GetString(), sb.GetSize())) {
 			KHLog::Format(L"queue.json could not be saved (error %lu)", GetLastError());
+			return false;
+		}
+		return true;
+	}
+
+	CStringW KeepListPath()
+	{
+		return AppDataDir() + L"keep_tracks.json";
+	}
+
+	CStringW KeepKey(const CStringW& pageUrl)
+	{
+		CStringW key = pageUrl;
+		key.Trim();
+		key.MakeLower();
+		return key;
+	}
+
+	KeepList LoadKeepList(const CStringW& path)
+	{
+		KeepList keep;
+		std::vector<char> data;
+		if (KHFile::ReadAll(path, data) != KHFile::ReadResult::Ok) {
+			return keep;
+		}
+		rapidjson::Document json;
+		json.Parse(data.data());
+		if (json.HasParseError() || !json.IsObject()) {
+			KHLog::Format(L"keep_tracks.json could not be read - the filter's exceptions start empty");
+			return keep;
+		}
+		if (const auto* tracks = GetJsonArray(json, "tracks")) {
+			for (const auto& v : tracks->GetArray()) {
+				if (v.IsString()) {
+					const CStringW url = KeepKey(CStringW(CA2W(v.GetString(), CP_UTF8)));
+					if (KHWebSession::IsSiteUrl(url.GetString())) {
+						keep.insert(url);
+					}
+				}
+			}
+		}
+		return keep;
+	}
+
+	namespace
+	{
+		KeepList& KeptStore()
+		{
+			static KeepList keep = LoadKeepList(KeepListPath());
+			return keep;
+		}
+	}
+
+	const KeepList& Kept()
+	{
+		return KeptStore();
+	}
+
+	bool IsKept(const CStringW& pageUrl)
+	{
+		return !pageUrl.IsEmpty() && KeptStore().count(KeepKey(pageUrl)) > 0;
+	}
+
+	void AddKept(const CStringW& pageUrl)
+	{
+		const CStringW key = KeepKey(pageUrl);
+		if (key.IsEmpty() || !KHWebSession::IsSiteUrl(key.GetString())) {
+			return;
+		}
+		if (KeptStore().insert(key).second) {
+			SaveKeepList(KeepListPath(), KeptStore());
+			KHLog::Format(L"filter: 'Play anyway' remembered for %s", key.GetString());
+		}
+	}
+
+	bool SaveKeepList(const CStringW& path, const KeepList& keep)
+	{
+		rapidjson::StringBuffer sb;
+		rapidjson::PrettyWriter<rapidjson::StringBuffer> w(sb);
+		w.StartObject();
+		w.Key("tracks");
+		w.StartArray();
+		for (const auto& url : keep) {
+			const CW2A u(url, CP_UTF8);
+			w.String(u, static_cast<rapidjson::SizeType>(strlen(u)));
+		}
+		w.EndArray();
+		w.EndObject();
+		if (!KHFile::WriteAtomic(path, sb.GetString(), sb.GetSize())) {
+			KHLog::Format(L"keep_tracks.json could not be saved (error %lu)", GetLastError());
 			return false;
 		}
 		return true;

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "KHParse.h"
+#include "AudioClassify.h"
 #include <functional>
 #include <vector>
 
@@ -57,11 +58,11 @@ namespace KHInsider
 	// Call before any worker starts.
 	void SetPreferredAudioFormat(const CStringW& ext);
 
-	// Download a prefix of the track and classify it as music, spoken, or
-	// (near-)silent, for the "skip non-music tracks" filter. Only mp3 is
-	// fetched and analysed here; anything else counts as music.
-	AudioVerdict ClassifyTrackAudio(const CStringW& audioUrl, const CStringW& trackName);
-	// The same analysis on decoded audio (mono, -1..1) - used for Ogg tracks,
-	// whose audio the cache decodes anyway.
-	AudioVerdict ClassifyMonoPcm(const std::vector<float>& mono, int hz, const CStringW& trackName);
+	// The talking-track check of an mp3: two 256 KB windows (after the ID3 tag,
+	// and the middle) fetched with ranged GETs and judged by KHAudio. Other
+	// formats, and anything that fails, come back not judged (= music).
+	KHAudio::Decision ClassifyTrackAudio(const CStringW& audioUrl);
+	// The same decision on decoded audio (mono, -1..1): Ogg tracks, which the
+	// cache decodes anyway. 'middle' may be empty.
+	KHAudio::Decision ClassifyMonoPcm(const std::vector<float>& first, const std::vector<float>& middle, int hz);
 }

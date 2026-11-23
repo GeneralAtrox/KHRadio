@@ -295,7 +295,11 @@ void CRadioPlayer::Remove(int index)
 		NotifyQueue();
 		return;
 	}
-	// the current item went away: move on to what is now at its place
+	MoveOnFromCurrent(); // what is now at its place, or the next playable item
+}
+
+void CRadioPlayer::MoveOnFromCurrent()
+{
 	++(*m_loadGen);
 	m_started = false;
 	m_sourceSet = false;
@@ -304,8 +308,9 @@ void CRadioPlayer::Remove(int index)
 		m_engine->Pause();
 	}
 	const bool wasRunning = m_state == State::Loading || m_state == State::Playing;
-	if (m_index >= static_cast<int>(m_queue.size())) {
-		m_index = static_cast<int>(m_queue.size()) - 1;
+	const int next = PlayableAtOrAfter(m_queue, m_index);
+	if (next < 0) {
+		m_index = std::min(m_index, static_cast<int>(m_queue.size()) - 1);
 		NotifyQueue();
 		SetState(State::Stopped);
 		if (wasRunning && m_listener) {
@@ -314,8 +319,32 @@ void CRadioPlayer::Remove(int index)
 		return;
 	}
 	if (wasRunning) {
-		Load(m_index, 0.0, false);
+		Load(next, 0.0, false);
 	} else {
+		m_index = next;
+		NotifyQueue();
+	}
+}
+
+void CRadioPlayer::MarkSkipped(int index, SkipReason why)
+{
+	QueueItem* item = Item(index);
+	if (!item || why == SkipReason::None) {
+		return;
+	}
+	item->skip = why;
+	if (index == m_index && !m_started) {
+		MoveOnFromCurrent(); // it was waiting to play: the next one plays instead
+	} else {
+		NotifyQueue(); // a track already playing finishes; next/prev pass over it
+	}
+}
+
+void CRadioPlayer::Unskip(int index)
+{
+	if (QueueItem* item = Item(index)) {
+		item->skip = SkipReason::None;
+		item->keep = true;
 		NotifyQueue();
 	}
 }
@@ -330,6 +359,25 @@ void CRadioPlayer::Load(int index, double startSec, bool resumed)
 {
 	if (!m_engine || index < 0 || index >= static_cast<int>(m_queue.size())) {
 		return;
+	}
+	if (m_queue[static_cast<size_t>(index)].IsSkipped()) {
+		// the filter passes over it: the next playable item instead
+		const int next = PlayableAtOrAfter(m_queue, index);
+		if (next < 0) {
+			++(*m_loadGen);
+			m_engine->Pause();
+			m_index = index;
+			m_started = m_sourceSet = m_waiting = false;
+			NotifyQueue();
+			SetState(State::Stopped);
+			if (m_listener) {
+				m_listener->OnQueueEnded();
+			}
+			return;
+		}
+		index = next;
+		startSec = 0.0;
+		resumed = false;
 	}
 	++(*m_loadGen); // events still queued for the previous track are ignored
 	m_index = index;
@@ -467,8 +515,9 @@ void CRadioPlayer::TogglePause()
 void CRadioPlayer::Next()
 {
 	m_errorsInRow = 0;
-	if (m_index + 1 < static_cast<int>(m_queue.size())) {
-		Load(m_index + 1, 0.0, false);
+	const int next = StepPlayable(m_queue, m_index, 1);
+	if (next >= 0) {
+		Load(next, 0.0, false);
 	} else {
 		// at the end: let the radio fetch more instead of stopping silently
 		Stop();
@@ -481,10 +530,11 @@ void CRadioPlayer::Next()
 void CRadioPlayer::Prev()
 {
 	m_errorsInRow = 0;
-	if (Position() > 3.0 || m_index <= 0) {
+	const int prev = StepPlayable(m_queue, m_index, -1);
+	if (Position() > 3.0 || prev < 0) {
 		Seek(0.0);
 	} else {
-		Load(m_index - 1, 0.0, false);
+		Load(prev, 0.0, false);
 	}
 }
 
@@ -537,8 +587,9 @@ void CRadioPlayer::SetVolume(double volume)
 
 void CRadioPlayer::Advance()
 {
-	if (m_index + 1 < static_cast<int>(m_queue.size())) {
-		Load(m_index + 1, 0.0, false);
+	const int next = StepPlayable(m_queue, m_index, 1);
+	if (next >= 0) {
+		Load(next, 0.0, false);
 	} else {
 		++(*m_loadGen);
 		SetState(State::Stopped);

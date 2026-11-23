@@ -1,24 +1,31 @@
 // KH Radio - tests. Offline by default: the parser on small hand-written pages,
 // share links (building, finding them in pasted text, refusing lookalikes),
-// response classification, retry delays, layout geometry, history files and the
-// browser session's shutdown. Opt-in live checks against downloads.khinsider.com:
+// response classification, retry delays, layout geometry, history files, the
+// talking-track filter (generated audio, title cues, album context, skipped
+// queue rows) and the browser session's shutdown. Opt-in live checks against downloads.khinsider.com:
 //   KHRadioTests --live     the saved sign-in (if any) reaches the site
 //   KHRadioTests --login    opens the sign-in window and waits up to 10 minutes
 // GPL-3.0-or-later (see COPYING.txt).
 #include "stdafx.h"
+#include "AppData.h"
 #include "AudioCache.h"
+#include "AudioClassify.h"
 #include "FileUtil.h"
 #include "History.h"
 #include "KHParse.h"
 #include "KHRadioLayout.h"
 #include "KHWebSession.h"
 #include "ShareLink.h"
+#include "TextUtil.h"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <future>
 #include <thread>
+#include <shlobj.h>
+#include <winhttp.h>
 
 static int g_passed = 0;
 static int g_failed = 0;
@@ -867,8 +874,618 @@ static int LiveCheck(HWND owner, const CStringW& dir, bool login)
 	return failed;
 }
 
+// ---- evaluation mode (not run by default) ---------------------------------
+// KHRadioTests --eval <list.tsv> <cache dir> <out.csv>
+// The list holds one track per line, tab-separated: id, label (S talking /
+// M music / Q unknown), half (tune/held), category, confidence, the 1.3 verdict,
+// its logged flux, pause, zcrCoV and peak, the mp3 address, then free text.
+// Each track's windows are fetched exactly as the app fetches them (ranged GETs,
+// one at a time, paced, at most 150 MB in all) and kept in the cache directory,
+// so a second run reads them from disk. Prints a short summary; the per-track
+// measures go to out.csv.
+
+namespace Eval
+{
+	constexpr unsigned long long kBudget = 150ull * 1024 * 1024;
+	unsigned long long g_netBytes = 0;
+	int g_netRequests = 0, g_cacheHits = 0, g_netFailures = 0;
+
+	bool HttpRange(const CStringW& url, unsigned long long from, unsigned long long to, KHAudio::RangeReply& reply)
+	{
+		reply = KHAudio::RangeReply();
+		WCHAR host[256] = {}, path[2048] = {};
+		URL_COMPONENTSW uc = { sizeof(uc) };
+		uc.lpszHostName = host;
+		uc.dwHostNameLength = static_cast<DWORD>(std::size(host));
+		uc.lpszUrlPath = path;
+		uc.dwUrlPathLength = static_cast<DWORD>(std::size(path));
+		if (!WinHttpCrackUrl(url, 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS) {
+			return false;
+		}
+		bool ok = false;
+		DWORD status = 0;
+		if (HINTERNET s = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)) {
+			WinHttpSetTimeouts(s, 10000, 10000, 15000, 20000);
+			if (HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0)) {
+				if (HINTERNET r = WinHttpOpenRequest(c, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)) {
+					CStringW headers;
+					headers.Format(L"Accept: */*\r\nRange: bytes=%llu-%llu\r\n", from, to);
+					if (WinHttpSendRequest(r, headers, static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr)) {
+						DWORD len = sizeof(status);
+						WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX);
+						WCHAR cr[128] = {};
+						len = sizeof(cr);
+						if (status == 206 && WinHttpQueryHeaders(r, WINHTTP_QUERY_CUSTOM, L"Content-Range", cr, &len, WINHTTP_NO_HEADER_INDEX)) {
+							const wchar_t* slash = wcschr(cr, L'/');
+							reply.total = slash ? _wcstoui64(slash + 1, nullptr, 10) : 0;
+							reply.partial = true;
+						}
+						const size_t want = static_cast<size_t>(to - from + 1);
+						std::vector<char> buf(65536);
+						while (status < 400 && reply.data.size() < want) {
+							DWORD got = 0;
+							if (!WinHttpReadData(r, buf.data(), static_cast<DWORD>(buf.size()), &got) || !got) {
+								break;
+							}
+							const size_t take = std::min<size_t>(got, want - reply.data.size());
+							reply.data.insert(reply.data.end(), buf.data(), buf.data() + take);
+						}
+						ok = status >= 200 && status < 300 && !reply.data.empty();
+					}
+					WinHttpCloseHandle(r);
+				}
+				WinHttpCloseHandle(c);
+			}
+			WinHttpCloseHandle(s);
+		}
+		return ok;
+	}
+
+	// Cached ranged GET: 16-byte header (total, partial) then the bytes.
+	bool CachedRange(const CStringW& cacheDir, const CStringW& url, unsigned long long from, unsigned long long to, KHAudio::RangeReply& reply)
+	{
+		unsigned long long h = 1469598103934665603ull;
+		for (int i = 0; i < url.GetLength(); i++) {
+			h = (h ^ static_cast<unsigned long long>(url[i])) * 1099511628211ull;
+		}
+		CStringW file;
+		file.Format(L"%s%016llx_%llu.bin", cacheDir.GetString(), h, from);
+		std::vector<char> data;
+		if (KHFile::ReadAll(file, data) == KHFile::ReadResult::Ok && data.size() > 17) {
+			unsigned long long head[2] = {};
+			memcpy(head, data.data(), sizeof(head));
+			reply = KHAudio::RangeReply();
+			reply.total = head[0];
+			reply.partial = head[1] != 0;
+			reply.data.assign(data.begin() + 16, data.end() - 1); // ReadAll adds a terminating zero
+			g_cacheHits++;
+			return true;
+		}
+		if (g_netBytes >= kBudget) {
+			return false;
+		}
+		Sleep(400); // one request at a time, paced
+		g_netRequests++;
+		if (!HttpRange(url, from, to, reply)) {
+			g_netFailures++;
+			return false;
+		}
+		g_netBytes += reply.data.size();
+		std::vector<char> out(16);
+		const unsigned long long head[2] = { reply.total, reply.partial ? 1ull : 0ull };
+		memcpy(out.data(), head, sizeof(head));
+		out.insert(out.end(), reply.data.begin(), reply.data.end());
+		KHFile::WriteAtomic(file, out.data(), out.size());
+		return true;
+	}
+
+	std::vector<CStringW> SplitTabs(const CStringW& line)
+	{
+		std::vector<CStringW> parts;
+		int start = 0;
+		for (;;) {
+			const int tab = line.Find(L'\t', start);
+			if (tab < 0) {
+				parts.push_back(line.Mid(start));
+				return parts;
+			}
+			parts.push_back(line.Mid(start, tab - start));
+			start = tab + 1;
+		}
+	}
+
+	void PutFeatures(FILE* out, const KHAudio::Features& f)
+	{
+		fprintf(out, ",%d,%d,%.2f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.3f,%.4f,%.4f,%.4f,%.4f", f.valid ? 1 : 0, f.quiet ? 1 : 0, f.seconds, f.peak,
+			f.flux, f.pause, f.zcrCoV, f.tonal, f.mod4, f.envStd, f.beat, f.centroidCoV, f.gaps, f.score);
+	}
+
+	int Run(const CStringW& listPath, CStringW cacheDir, const CStringW& outPath)
+	{
+		if (cacheDir.Right(1) != L"\\") {
+			cacheDir += L"\\";
+		}
+		SHCreateDirectoryExW(nullptr, cacheDir, nullptr);
+		std::vector<char> raw;
+		if (KHFile::ReadAll(listPath, raw) != KHFile::ReadResult::Ok) {
+			fprintf(stderr, "eval: cannot read the list\n");
+			return 2;
+		}
+		FILE* out = nullptr;
+		if (_wfopen_s(&out, outPath, L"w") != 0 || !out) {
+			fprintf(stderr, "eval: cannot write the output\n");
+			return 2;
+		}
+		fputs("id,label,half,old_logged,old_flux_logged,bytes,windows,old_rule,score,verdict,strength,cue,album_spoken", out);
+		for (int w = 1; w <= 2; w++) {
+			fprintf(out, ",w%d_valid,w%d_quiet,w%d_sec,w%d_peak,w%d_flux,w%d_pause,w%d_zcrcov,w%d_tonal,w%d_mod4,w%d_envstd,w%d_beat,w%d_centcov,w%d_gaps,w%d_score",
+				w, w, w, w, w, w, w, w, w, w, w, w, w, w);
+		}
+		fputs("\n", out);
+		const CStringW text = UTF8ToWStr(raw.data());
+		int pos = 0, tracks = 0;
+		std::map<CStringW, std::array<int, 4>> tally; // label -> talking, silent, music, unjudged
+		std::map<CStringW, std::array<int, 2>> oldTally; // label -> talking/silent by the 1.3 rule (recomputed), music
+		for (CStringW line = text.Tokenize(L"\r\n", pos); pos >= 0; line = text.Tokenize(L"\r\n", pos)) {
+			const auto f = SplitTabs(line);
+			if (f.size() < 11 || !KHInsider::IsAllowedMediaUrl(f[10])) {
+				continue;
+			}
+			const CStringW url = f[10];
+			size_t bytes = 0;
+			const auto d = KHAudio::ClassifyMp3([&](unsigned long long a, unsigned long long b, KHAudio::RangeReply& r) {
+				return CachedRange(cacheDir, url, a, b, r);
+			}, &bytes);
+			tracks++;
+			const bool oldSpoken = d.windows > 0 && (KHAudio::OldRuleSpoken(d.w[0]) || d.w[0].quiet);
+			const int v = !d.judged ? 3 : d.verdict == KHInsider::AudioVerdict::Spoken ? 0 : d.verdict == KHInsider::AudioVerdict::Quiet ? 1 : 2;
+			tally[f[1]][v]++;
+			oldTally[f[1]][oldSpoken ? 0 : 1]++;
+			const int cue = static_cast<int>(KHInsider::SpokenTitleCue(f.size() > 12 ? f[12] : CStringW()));
+			const int albumSpoken = f.size() > 11 && KHInsider::IsSpokenTitle(f[11]) ? 1 : 0;
+			fprintf(out, "%ls,%ls,%ls,%ls,%ls,%zu,%d,%d,%.4f,%d,%d,%d,%d", f[0].GetString(), f[1].GetString(), f[2].GetString(), f[5].GetString(), f[6].GetString(),
+				bytes, d.windows, oldSpoken ? 1 : 0, d.score, v, static_cast<int>(d.strength), cue, albumSpoken);
+			for (int w = 0; w < 2; w++) {
+				PutFeatures(out, d.w[w]);
+			}
+			fputs("\n", out);
+			fflush(out);
+		}
+		fclose(out);
+		printf("eval: %d tracks; network %d requests, %.1f MB, %d failed; %d windows from the cache%s\n", tracks, g_netRequests,
+			g_netBytes / 1048576.0, g_netFailures, g_cacheHits, g_netBytes >= kBudget ? " (BUDGET REACHED)" : "");
+		for (const auto& [label, t] : tally) {
+			printf("eval: label %ls: new talking %d, silent %d, music %d, unjudged %d | 1.3 rule (recomputed) dropped %d, kept %d\n",
+				label.GetString(), t[0], t[1], t[2], t[3], oldTally[label][0], oldTally[label][1]);
+		}
+		return 0;
+	}
+}
+
+// ---- the talking-track filter (1.4) ----------------------------------------
+
+namespace Synth
+{
+	constexpr int kHz = 22050;
+	constexpr double kTwoPi = 6.283185307179586;
+
+	struct Rng {
+		unsigned s;
+		explicit Rng(unsigned seed) : s(seed * 2654435761u + 1u) {}
+		double Next() { s = s * 1664525u + 1013904223u; return (s >> 8) / 8388608.0 - 1.0; } // -1..1
+		double Uniform(double a, double b) { return a + (b - a) * (Next() * 0.5 + 0.5); }
+	};
+
+	std::vector<float> Silence(double sec) { return std::vector<float>(static_cast<size_t>(sec * kHz), 0.0f); }
+
+	std::vector<float> Tone(double sec, double hzTone, double amp)
+	{
+		std::vector<float> x(static_cast<size_t>(sec * kHz));
+		for (size_t i = 0; i < x.size(); i++) {
+			x[i] = static_cast<float>(amp * std::sin(kTwoPi * hzTone * i / kHz));
+		}
+		return x;
+	}
+
+	// a held major chord with a kick on every beat and a hi-hat between
+	std::vector<float> ChordWithBeat(double sec, unsigned seed)
+	{
+		Rng rng(seed);
+		std::vector<float> x(static_cast<size_t>(sec * kHz));
+		const double chord[] = { 261.6, 329.6, 392.0 };
+		for (size_t i = 0; i < x.size(); i++) {
+			const double t = static_cast<double>(i) / kHz;
+			double v = 0.0;
+			for (const double f : chord) {
+				v += 0.08 * std::sin(kTwoPi * f * t);
+			}
+			const double inBeat = std::fmod(t, 0.5);
+			v += 0.5 * std::exp(-inBeat * 30.0) * std::sin(kTwoPi * 60.0 * inBeat);
+			const double inHat = std::fmod(t + 0.25, 0.5);
+			v += 0.15 * std::exp(-inHat * 80.0) * rng.Next();
+			x[i] = static_cast<float>(v);
+		}
+		return x;
+	}
+
+	// plucked notes that ring and fade: a music box or a piano line
+	std::vector<float> MusicBox(double sec, unsigned seed)
+	{
+		Rng rng(seed);
+		const double scale[] = { 523.3, 587.3, 659.3, 784.0, 880.0, 1046.5 };
+		std::vector<float> x(static_cast<size_t>(sec * kHz));
+		for (double start = 0.0; start < sec; start += 0.375) {
+			const double f = scale[static_cast<int>(rng.Uniform(0, 5.99))];
+			for (size_t i = static_cast<size_t>(start * kHz); i < x.size() && i < static_cast<size_t>((start + 1.5) * kHz); i++) {
+				const double t = static_cast<double>(i) / kHz - start;
+				x[i] += static_cast<float>(0.25 * std::exp(-t / 0.6) * (std::sin(kTwoPi * f * t) + 0.3 * std::sin(kTwoPi * 2 * f * t)));
+			}
+		}
+		return x;
+	}
+
+	// a square-wave arpeggio: chiptune
+	std::vector<float> SquareArpeggio(double sec)
+	{
+		const double notes[] = { 220.0, 277.2, 329.6, 440.0 };
+		std::vector<float> x(static_cast<size_t>(sec * kHz));
+		double phase = 0.0;
+		for (size_t i = 0; i < x.size(); i++) {
+			const int step = static_cast<int>(static_cast<double>(i) / kHz / 0.125);
+			phase += notes[step % 4] / kHz;
+			x[i] = static_cast<float>(std::fmod(phase, 1.0) < 0.5 ? 0.15 : -0.15);
+		}
+		return x;
+	}
+
+	// slow swelling held notes: ambient
+	std::vector<float> AmbientPad(double sec)
+	{
+		const double notes[] = { 110.0, 164.8, 220.0, 277.2, 329.6 };
+		std::vector<float> x(static_cast<size_t>(sec * kHz));
+		for (size_t i = 0; i < x.size(); i++) {
+			const double t = static_cast<double>(i) / kHz;
+			double v = 0.0;
+			for (int k = 0; k < 5; k++) {
+				v += 0.05 * (0.6 + 0.4 * std::sin(kTwoPi * 0.15 * t + k)) * std::sin(kTwoPi * notes[k] * t);
+			}
+			x[i] = static_cast<float>(v);
+		}
+		return x;
+	}
+
+	std::vector<float> AmNoise(double sec, double rate, unsigned seed)
+	{
+		Rng rng(seed);
+		std::vector<float> x(static_cast<size_t>(sec * kHz));
+		for (size_t i = 0; i < x.size(); i++) {
+			const double t = static_cast<double>(i) / kHz;
+			x[i] = static_cast<float>(0.2 * (0.5 + 0.5 * std::sin(kTwoPi * rate * t)) * rng.Next());
+		}
+		return x;
+	}
+
+	std::vector<float> NoiseBursts(double sec, unsigned seed)
+	{
+		Rng rng(seed);
+		std::vector<float> x(static_cast<size_t>(sec * kHz), 0.0f);
+		for (double t = 0.0; t < sec;) {
+			const double len = rng.Uniform(0.1, 0.4);
+			for (size_t i = static_cast<size_t>(t * kHz); i < x.size() && i < static_cast<size_t>((t + len) * kHz); i++) {
+				x[i] = static_cast<float>(0.25 * rng.Next());
+			}
+			t += len + rng.Uniform(0.2, 0.8);
+		}
+		return x;
+	}
+
+	// Speech-like: voiced syllables with a gliding pitch and moving harmonics,
+	// short gaps between them, longer pauses between phrases, and a few hissy
+	// consonants.
+	std::vector<float> Talking(double sec, unsigned seed)
+	{
+		Rng rng(seed);
+		std::vector<float> x(static_cast<size_t>(sec * kHz), 0.0f);
+		double t = 0.2;
+		int inPhrase = 0, phraseLen = 5;
+		while (t < sec) {
+			const double len = rng.Uniform(0.12, 0.30);
+			const double f0 = rng.Uniform(110.0, 220.0), f1 = f0 * rng.Uniform(0.7, 1.3);
+			double w[10];
+			for (int k = 0; k < 10; k++) {
+				w[k] = rng.Uniform(0.2, 1.0) / (k + 1);
+			}
+			double phase = 0.0;
+			const size_t a = static_cast<size_t>(t * kHz), b = std::min(x.size(), static_cast<size_t>((t + len) * kHz));
+			for (size_t i = a; i < b; i++) {
+				const double u = static_cast<double>(i - a) / (b - a);
+				phase += kTwoPi * (f0 + (f1 - f0) * u) / kHz;
+				double v = 0.0;
+				for (int k = 0; k < 10; k++) {
+					v += w[k] * std::sin((k + 1) * phase);
+				}
+				x[i] = static_cast<float>(0.12 * std::sin(3.14159265 * u) * v);
+			}
+			t += len;
+			if (rng.Uniform(0, 1) < 0.3) { // a consonant: a short hiss
+				const size_t c = static_cast<size_t>(t * kHz), d = std::min(x.size(), c + static_cast<size_t>(0.07 * kHz));
+				double prev = 0.0;
+				for (size_t i = c; i < d; i++) {
+					const double n = rng.Next();
+					x[i] = static_cast<float>(0.08 * (n - prev));
+					prev = n;
+				}
+				t += 0.07;
+			}
+			if (++inPhrase >= phraseLen) {
+				inPhrase = 0;
+				phraseLen = 3 + static_cast<int>(rng.Uniform(0, 5.99));
+				t += rng.Uniform(0.3, 0.8);
+			} else {
+				t += rng.Uniform(0.03, 0.10);
+			}
+		}
+		return x;
+	}
+}
+
+// verbose: print every measure (KHRadioTests --synth)
+static bool g_synthVerbose = false;
+
+static KHAudio::Decision JudgeSynth(const std::vector<float>& first, const std::vector<float>& middle, const char* what)
+{
+	const auto d = KHAudio::ClassifyPcmWindows(first, middle, Synth::kHz);
+	if (g_synthVerbose) {
+		fprintf(stderr, "  synth %-22s %ls\n", what, KHAudio::Describe(d).GetString());
+	}
+	return d;
+}
+
+static void TestTalkingDetector()
+{
+	using namespace Synth;
+	using KHInsider::AudioVerdict;
+	const auto isMusic = [](const KHAudio::Decision& d) { return d.judged && d.verdict == AudioVerdict::Music; };
+
+	CHECK(isMusic(JudgeSynth(Tone(12, 440, 0.3), Tone(12, 330, 0.3), "tone")));
+	CHECK(isMusic(JudgeSynth(ChordWithBeat(12, 1), ChordWithBeat(12, 2), "chord with beat")));
+	CHECK(isMusic(JudgeSynth(MusicBox(12, 3), MusicBox(12, 4), "music box / piano")));
+	CHECK(isMusic(JudgeSynth(SquareArpeggio(12), SquareArpeggio(12), "chiptune arpeggio")));
+	CHECK(isMusic(JudgeSynth(AmbientPad(12), AmbientPad(12), "ambient pad")));
+	CHECK(isMusic(JudgeSynth(AmNoise(12, 4.0, 5), AmNoise(12, 4.0, 6), "4 Hz AM noise")));
+
+	const auto bursts = JudgeSynth(NoiseBursts(12, 7), NoiseBursts(12, 8), "noise bursts + pauses");
+	CHECK(bursts.judged && bursts.w[0].tonal < 0.3 && bursts.w[0].pause > 0.2);
+
+	const auto talk = JudgeSynth(Talking(12, 9), Talking(12, 10), "talking");
+	CHECK(talk.verdict == AudioVerdict::Spoken && talk.strength >= KHAudio::Strength::Moderate);
+
+	// a spoken intro, then music in the middle: kept
+	CHECK(isMusic(JudgeSynth(Talking(12, 11), ChordWithBeat(12, 12), "talking, then music")));
+	// a medley of talking over a beat in one window is not "talking in every window"
+	CHECK(isMusic(JudgeSynth(MusicBox(12, 13), Talking(12, 14), "music, then talking")));
+
+	const auto silent = JudgeSynth(Silence(12), Silence(12), "silence");
+	CHECK(silent.verdict == AudioVerdict::Quiet);
+	// a quiet intro (the 1.3 filter dropped these as silent) and a loud middle
+	std::vector<float> faint = Tone(12, 440, 0.005);
+	const auto quietIntro = JudgeSynth(faint, ChordWithBeat(12, 15), "quiet intro, then loud");
+	CHECK(quietIntro.verdict != AudioVerdict::Quiet && quietIntro.verdict != AudioVerdict::Spoken);
+	// only one window that can be judged (a short track)
+	const auto one = KHAudio::ClassifyPcmWindows(Tone(5, 440, 0.3), {}, kHz);
+	CHECK(one.judged && one.windows == 1 && one.verdict == AudioVerdict::Music);
+	// under a second: not judged, counts as music
+	const auto tiny = KHAudio::ClassifyPcmWindows(Tone(0.5, 440, 0.3), {}, kHz);
+	CHECK(!tiny.judged && tiny.verdict == AudioVerdict::Music);
+
+	// Decide: every window must agree; the weaker window sets the strength
+	KHAudio::Features a, b;
+	a.valid = b.valid = true;
+	a.score = 3.5; b.score = -0.5;
+	KHAudio::Features both[2] = { a, b };
+	CHECK(KHAudio::Decide(both, 2).verdict == AudioVerdict::Music);
+	both[1].score = 2.7;
+	CHECK(KHAudio::Decide(both, 2).strength == KHAudio::Strength::Strong);
+	both[1].score = 3.2;
+	CHECK(KHAudio::Decide(both, 2).strength == KHAudio::Strength::VeryStrong);
+	both[1].score = 1.2;
+	CHECK(KHAudio::Decide(both, 2).strength == KHAudio::Strength::Moderate);
+	both[1].score = 0.4;
+	CHECK(KHAudio::Decide(both, 2).strength == KHAudio::Strength::Weak);
+	both[1].score = -0.4;
+	CHECK(KHAudio::Decide(both, 2).strength == KHAudio::Strength::None);
+	both[1].quiet = true; both[1].score = -1.0;
+	CHECK(KHAudio::Decide(both, 2).verdict == AudioVerdict::Music); // a silent window is not talking
+
+	// the middle window: placed from the file size, none when the file is short
+	CHECK(KHAudio::MiddleWindowStart(0, 0, KHAudio::kWindowBytes) == 0);
+	CHECK(KHAudio::MiddleWindowStart(400000, 0, KHAudio::kWindowBytes) == 0);
+	CHECK(KHAudio::MiddleWindowStart(4000000, 1000, KHAudio::kWindowBytes) == 1000 + (4000000 - 1000) / 2 - KHAudio::kWindowBytes / 2);
+	std::vector<float> mono;
+	int hz = 0;
+	const unsigned char junk[64] = { 1, 2, 3 };
+	CHECK(!KHAudio::DecodeMp3(junk, sizeof(junk), 0, 30.0, mono, hz));
+}
+
+static void TestAlbumContext()
+{
+	using KHInsider::AudioVerdict;
+	using KHInsider::TitleCue;
+	const auto talking = [](KHAudio::Strength s) {
+		KHAudio::Decision d;
+		d.judged = true;
+		d.windows = 2;
+		d.verdict = s == KHAudio::Strength::None ? AudioVerdict::Music : AudioVerdict::Spoken;
+		d.strength = s;
+		return d;
+	};
+	KHAudio::AlbumTally fresh, musical, drama;
+	for (int i = 0; i < 6; i++) {
+		musical.Add(talking(KHAudio::Strength::None));
+	}
+	for (int i = 0; i < 3; i++) {
+		drama.Add(talking(KHAudio::Strength::Moderate));
+	}
+	drama.Add(talking(KHAudio::Strength::None));
+	CHECK(musical.Musical() && !musical.MostlyTalking());
+	CHECK(drama.MostlyTalking() && !drama.Musical());
+	CHECK(!fresh.Musical() && !fresh.MostlyTalking());
+
+	const auto skip = [](const KHAudio::Decision& d, TitleCue cue, const KHAudio::AlbumTally& t) {
+		return KHAudio::ApplyAlbumContext(d, cue, t).skip;
+	};
+	const auto weak = talking(KHAudio::Strength::Weak);
+	CHECK(skip(weak, TitleCue::None, fresh) == SkipReason::None);
+	CHECK(skip(weak, TitleCue::None, drama) == SkipReason::None);
+	CHECK(skip(weak, TitleCue::Weak, musical) == SkipReason::Talking); // "#scene12" in a soundtrack
+	const auto mod = talking(KHAudio::Strength::Moderate), strong = talking(KHAudio::Strength::Strong),
+		very = talking(KHAudio::Strength::VeryStrong), music = talking(KHAudio::Strength::None);
+	// a fresh album: strong talking on its own
+	CHECK(skip(mod, TitleCue::None, fresh) == SkipReason::None);
+	CHECK(skip(strong, TitleCue::None, fresh) == SkipReason::Talking);
+	// a title cue lowers the bar to moderate, but never drops music
+	CHECK(skip(mod, TitleCue::Weak, fresh) == SkipReason::Talking);
+	CHECK(skip(music, TitleCue::Weak, fresh) == SkipReason::None);
+	// one or two odd tracks in a musical album are kept unless very strong
+	CHECK(skip(strong, TitleCue::None, musical) == SkipReason::None);
+	CHECK(skip(very, TitleCue::None, musical) == SkipReason::Talking);
+	CHECK(skip(mod, TitleCue::Weak, musical) == SkipReason::Talking); // "Scene 4" in a soundtrack
+	// an album that is mostly talking: moderate is enough
+	CHECK(skip(mod, TitleCue::None, drama) == SkipReason::Talking);
+	CHECK(skip(music, TitleCue::None, drama) == SkipReason::None);
+	// silent and not judged
+	KHAudio::Decision quiet;
+	quiet.judged = true;
+	quiet.verdict = AudioVerdict::Quiet;
+	CHECK(skip(quiet, TitleCue::None, musical) == SkipReason::Silent);
+	CHECK(skip(KHAudio::Decision(), TitleCue::Strong, drama) == SkipReason::None);
+	// the tally ignores silent and unjudged tracks
+	KHAudio::AlbumTally t;
+	t.Add(quiet);
+	t.Add(KHAudio::Decision());
+	CHECK(t.judged == 0);
+}
+
+static void TestTitleCues()
+{
+	using KHInsider::TitleCue;
+	CStringW m;
+	// strong: enough on their own (invented titles)
+	CHECK(SpokenTitleCue(L"Bonus Drama CD Part 1") == TitleCue::Strong);
+	CHECK(SpokenTitleCue(L"Mini Drama \"The Lost Key\"") == TitleCue::Strong);
+	CHECK(SpokenTitleCue(L"Cast Comment (Hero & Rival)", &m) == TitleCue::Strong && m == L"cast comment");
+	CHECK(SpokenTitleCue(L"ミニドラマ「星の庭」") == TitleCue::Strong);
+	CHECK(SpokenTitleCue(L"ボイスドラマ 第1話") == TitleCue::Strong);
+	CHECK(SpokenTitleCue(L"Voice Collection 2") == TitleCue::Strong);
+	// weak: the audio must agree
+	CHECK(SpokenTitleCue(L"Scene 12 - The Bridge") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"#scene4b") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"Drama Part 3") == TitleCue::Strong);
+	CHECK(SpokenTitleCue(L"Afterword Drama") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"Message from the Cast") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"Free Talk") == TitleCue::Strong);
+	CHECK(SpokenTitleCue(L"Midnight Talk") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"Opening Cutscene") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"Lumi Voice") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"Skit 05") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"ドラマ「夏の終わり」") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"第3話 迷子の猫") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"第十二話") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"キャラクターメッセージ") == TitleCue::Weak);
+	CHECK(SpokenTitleCue(L"セリフ集 Vol.2") == TitleCue::Strong);
+	CHECK(SpokenTitleCue(L"ナレーション") == TitleCue::Weak);
+	// music titles that must not match
+	CHECK(SpokenTitleCue(L"Dramatic Escape") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"ドラマチック・ナイト") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"ドラマティック") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"ドラマーの夢") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Bike Ride (Skitchin' Mix)") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Hall of Voices") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"A voice calls me home") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Voice of the Deep") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Inner Voice") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Talkative Town") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Messages in the Sand") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Behind the Scenes") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Final Scene") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"Seen and Unseen") == TitleCue::None);
+	CHECK(SpokenTitleCue(L"第2章の扉") == TitleCue::Weak); // chapters: weak only, the audio decides
+	CHECK(SpokenTitleCue(L"Green Hill Zone") == TitleCue::None);
+	// album titles: a drama / voice album is rerolled
+	CHECK(IsSpokenTitle(L"Starfall Drama CD Vol. 1"));
+	CHECK(IsSpokenTitle(L"Starfall Radio DJCD"));
+	CHECK(IsSpokenTitle(L"Moonlit Garden Mini Story CD"));
+	CHECK(IsSpokenTitle(L"ドラマCD 星の庭"));
+	CHECK(!IsSpokenTitle(L"Dramatic Orchestra Arrange"));
+	CHECK(!IsSpokenTitle(L"Starfall Original Soundtrack"));
+	CHECK(!IsSpokenTitle(L"Voices of the Lighthouse"));
+	// short tracks: unknown length is never short, 0 turns it off
+	CHECK(IsShortTrack(5, 10));
+	CHECK(!IsShortTrack(10, 10));
+	CHECK(!IsShortTrack(0, 10));
+	CHECK(!IsShortTrack(5, 0));
+}
+
+static void TestSkippedQueue(const CStringW& dir)
+{
+	std::vector<QueueItem> q(6);
+	for (size_t i = 0; i < q.size(); i++) {
+		q[i].id = 100 + i;
+		q[i].pageUrl.Format(L"https://downloads.khinsider.com/game-soundtracks/album/test-album/%02d.mp3", static_cast<int>(i));
+		q[i].label.Format(L"%02d. Track", static_cast<int>(i));
+	}
+	q[1].skip = SkipReason::Talking;
+	q[2].skip = SkipReason::Short;
+	q[5].skip = SkipReason::Title;
+	CHECK(StepPlayable(q, 0, 1) == 3);
+	CHECK(StepPlayable(q, 3, -1) == 0);
+	CHECK(StepPlayable(q, 4, 1) == -1);
+	CHECK(StepPlayable(q, 0, -1) == -1);
+	CHECK(PlayableAtOrAfter(q, 1) == 3);
+	CHECK(PlayableAtOrAfter(q, 0) == 0);
+	CHECK(PlayableAtOrAfter(q, 5) == -1);
+	CHECK(AheadLimit(q, 0, 1) == 3);          // the skipped rows don't use up the window
+	CHECK(AheadLimit(q, 0, 2) == 4);
+	CHECK(AheadLimit(q, 0, 3) == 5);          // nothing playable left: to the end
+	CHECK(CountPlayableAfter(q, 0) == 2);
+	CHECK(CountPlayableAfter(q, -1) == 3);
+
+	// queue.json keeps the skipped rows and "Play anyway"
+	q[4].keep = true;
+	const CStringW path = dir + L"queue-test.json";
+	CHECK(KHRadioData::SaveQueue(path, q, 3, 12.5));
+	const auto loaded = KHRadioData::LoadQueue(path);
+	CHECK(loaded.items.size() == q.size());
+	CHECK(loaded.index == 3);
+	if (loaded.items.size() == q.size()) {
+		CHECK(loaded.items[1].skip == SkipReason::Talking);
+		CHECK(loaded.items[2].skip == SkipReason::Short);
+		CHECK(loaded.items[5].skip == SkipReason::Title);
+		CHECK(loaded.items[0].skip == SkipReason::None && !loaded.items[0].keep);
+		CHECK(loaded.items[4].keep);
+		CHECK(!loaded.items[1].judged);
+	}
+	CHECK(SkipReasonFromKey(L"talking") == SkipReason::Talking);
+	CHECK(SkipReasonFromKey(L"nonsense") == SkipReason::None);
+
+	// the "Play anyway" list: page addresses, case-blind, KHInsider only
+	const CStringW keepPath = dir + L"keep-test.json";
+	KHRadioData::KeepList keep;
+	keep.insert(KHRadioData::KeepKey(L"https://downloads.khinsider.com/game-soundtracks/album/Test-Album/03.mp3"));
+	CHECK(KHRadioData::SaveKeepList(keepPath, keep));
+	const auto back = KHRadioData::LoadKeepList(keepPath);
+	CHECK(back.size() == 1);
+	CHECK(back.count(KHRadioData::KeepKey(L"https://downloads.khinsider.com/game-soundtracks/album/test-album/03.mp3")) == 1);
+	CHECK(WriteText(keepPath, "{\"tracks\":[\"https://example.com/x\",\"https://downloads.khinsider.com/a\",7]}"));
+	CHECK(KHRadioData::LoadKeepList(keepPath).size() == 1);
+	CHECK(KHRadioData::LoadKeepList(dir + L"missing.json").empty());
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+	if (argc >= 5 && wcscmp(argv[1], L"--eval") == 0) {
+		return Eval::Run(argv[2], argv[3], argv[4]);
+	}
 	if (!AfxWinInit(GetModuleHandleW(nullptr), nullptr, GetCommandLineW(), 0)) {
 		fputs("FAIL: MFC did not start\n", stderr);
 		return 2;
@@ -894,6 +1511,11 @@ int wmain(int argc, wchar_t** argv)
 	TestHistory(dir);
 	TestAudioCache(dir);
 	TestOggDecode(dir);
+	g_synthVerbose = argc > 1 && wcscmp(argv[1], L"--synth") == 0;
+	TestTalkingDetector();
+	TestAlbumContext();
+	TestTitleCues();
+	TestSkippedQueue(dir);
 
 
 	HWND owner = CreateWindowExW(0, L"STATIC", L"KH Radio tests", WS_OVERLAPPEDWINDOW,

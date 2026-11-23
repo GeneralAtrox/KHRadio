@@ -53,11 +53,15 @@ public:
 	int FindById(UINT64 id) const;
 	int CurrentIndex() const { return m_index; }
 	const QueueItem* Current() const;
-	bool IsAtEnd() const { return m_index >= 0 && m_index == static_cast<int>(m_queue.size()) - 1; }
 	bool IsWaitingForResolve() const { return m_waiting; }
 	void UpdateAlbumCover(const CStringW& albumUrl, const CStringW& coverPath);
 	// The audio URL for an item arrived; if it is the one waiting to play, it starts.
 	void Resolve(int index, const CStringW& audioUrl);
+	// The filter passes over this item from now on (it stays in the queue). If it
+	// is the current one, the next playable item takes its place.
+	void MarkSkipped(int index, SkipReason why);
+	// "Play anyway": the filter leaves the item alone from now on.
+	void Unskip(int index);
 	// The item's file in the audio cache is ready (it must be a cache file), or,
 	// with an empty path, the item plays from its address instead. If it is the
 	// one waiting to play, it starts.
@@ -65,7 +69,8 @@ public:
 	// Drops an item that can't be played; if it was the current one, the next plays.
 	void Remove(int index);
 
-	// transport (user actions: each one clears the failed-in-a-row count)
+	// transport (user actions: each one clears the failed-in-a-row count).
+	// Skipped items are stepped over: PlayIndex on one plays the next playable item.
 	void PlayIndex(int index, double startSec = 0.0, bool resumed = false);
 	void Play();
 	void Pause();
@@ -86,6 +91,7 @@ private:
 	HRESULT OpenLocal(const CStringW& path);
 	bool TryLocalCopy(const CStringW& why); // a failed m4a stream: play a downloaded copy instead
 	void Advance(); // after an end or an error
+	void MoveOnFromCurrent(); // the current item left or is skipped: the next playable one takes over
 	void Fail(const CStringW& message);
 	void SetState(State state);
 	void NotifyQueue();

@@ -2,6 +2,7 @@
 // GPL-3.0-or-later (see COPYING.txt).
 #pragma once
 #include <atlstr.h>
+#include <set>
 #include <vector>
 #include "RadioTypes.h"
 
@@ -30,6 +31,9 @@ namespace KHRadioData
 		CStringW platforms;
 		bool avoidPlayed = true;
 		bool filterSpoken = false;
+		// Tracks shorter than this many seconds are skipped while the filter is on
+		// (settings.json only; 0 turns it off). An unknown length is never short.
+		int minTrackSeconds = 10;
 		bool exclusive = false;
 		double volume = 0.8;
 		bool hasPlacement = false;
@@ -69,4 +73,19 @@ namespace KHRadioData
 	};
 	SavedQueue LoadQueue();
 	bool SaveQueue(const std::vector<QueueItem>& items, int index, double position);
+	// The same with a chosen file (tests).
+	SavedQueue LoadQueue(const CStringW& path);
+	bool SaveQueue(const CStringW& path, const std::vector<QueueItem>& items, int index, double position);
+
+	// Tracks the user chose "Play anyway" on: the talking-track filter leaves them
+	// alone from then on. Keyed by the track page address in lower case.
+	using KeepList = std::set<CStringW>;
+	CStringW KeepListPath(); // %APPDATA%\KHRadio\keep_tracks.json
+	CStringW KeepKey(const CStringW& pageUrl);
+	KeepList LoadKeepList(const CStringW& path);
+	bool SaveKeepList(const CStringW& path, const KeepList& keep);
+	// The app's own list (UI thread): read from KeepListPath() on first use.
+	const KeepList& Kept();
+	bool IsKept(const CStringW& pageUrl);
+	void AddKept(const CStringW& pageUrl); // and saves the file
 }

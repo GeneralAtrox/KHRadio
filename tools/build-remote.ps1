@@ -22,7 +22,13 @@ param(
     [Parameter(Mandatory = $true)][string]$RemoteDir,
     [string[]]$Configurations = @('Release'),
     [switch]$Smoke,
-    [switch]$KeepRemote
+    [switch]$KeepRemote,
+    # Optional: run the talking-track evaluation (KHRadioTests --eval) on this
+    # list after the build; its CSV comes back to EvalOut. EvalCache is a folder
+    # on the build machine that keeps the fetched audio between runs.
+    [string]$EvalList = '',
+    [string]$EvalCache = '',
+    [string]$EvalOut = ''
 )
 $ErrorActionPreference = 'Stop'
 $Configurations = @($Configurations -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) # -File passes a list as one string
@@ -36,7 +42,7 @@ if ($Configurations -notcontains 'Release') { $Configurations = @('Release') + $
 # Windows' own tar, relative paths only (an absolute C: path reads as a host name to some tars)
 Push-Location $root
 try {
-    & "$env:SystemRoot\System32\tar.exe" -cf $tar --exclude=./_build --exclude=./bin --exclude=./.vs --exclude=*.user .
+    & "$env:SystemRoot\System32\tar.exe" -cf $tar --exclude=./_build --exclude=./bin --exclude=./.vs --exclude=./.work --exclude=*.user .
     if ($LASTEXITCODE -ne 0) { throw 'packing the sources failed' }
 } finally { Pop-Location }
 "packed: $([math]::Round((Get-Item $tar).Length / 1MB, 1)) MB"
@@ -57,9 +63,20 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'copying to the build machine failed' }
 
     $smokeArg = if ($Smoke) { ' -Smoke' } else { '' }
+    if ($EvalList) {
+        if (-not $EvalCache -or -not $EvalOut) { throw '-EvalList needs -EvalCache and -EvalOut' }
+        & scp -q $EvalList "${HostName}:$remote/eval-list.tsv"
+        if ($LASTEXITCODE -ne 0) { throw 'copying the evaluation list failed' }
+        $smokeArg += " -EvalList '$rq\eval-list.tsv' -EvalCache '$($EvalCache.Replace("'", "''"))'"
+    }
     $output = Invoke-Remote "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$rq\remote-run.ps1' -Root '$rq' -Configurations $cfgList$smokeArg"
     $output | ForEach-Object { $_ }
     $passed = ($output | Select-Object -Last 1) -eq 'REMOTE VERDICT: PASS'
+    if ($EvalList -and $passed) {
+        New-Item -ItemType Directory -Force -Path $EvalOut | Out-Null
+        & scp -q "${HostName}:$remote/eval.csv" (Join-Path $EvalOut 'eval.csv')
+        if ($LASTEXITCODE -ne 0) { 'eval: could not copy eval.csv back' }
+    }
 
     if ($passed) {
         $bin = Join-Path $root 'bin'

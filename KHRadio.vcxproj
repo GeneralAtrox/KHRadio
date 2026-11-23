@@ -89,6 +89,7 @@
     <ClCompile Include="src\App.cpp" />
     <ClCompile Include="src\AppData.cpp" />
     <ClCompile Include="src\AudioCache.cpp" />
+    <ClCompile Include="src\AudioClassify.cpp" />
     <ClCompile Include="src\FileUtil.cpp" />
     <ClCompile Include="src\History.cpp" />
     <ClCompile Include="src\KHInsider.cpp" />
@@ -111,6 +112,7 @@
   <ItemGroup>
     <ClInclude Include="src\AppData.h" />
     <ClInclude Include="src\AudioCache.h" />
+    <ClInclude Include="src\AudioClassify.h" />
 
     <ClInclude Include="src\FileUtil.h" />
     <ClInclude Include="src\History.h" />

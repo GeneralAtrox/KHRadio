@@ -6,7 +6,9 @@
 param(
     [Parameter(Mandatory = $true)][string]$Root,
     [string[]]$Configurations = @('Release'),
-    [switch]$Smoke
+    [switch]$Smoke,
+    [string]$EvalList = '',  # optional: run the talking-track evaluation on this list (see tests\KHRadioTests.cpp)
+    [string]$EvalCache = ''  # where the evaluation keeps fetched windows between runs
 )
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
@@ -83,6 +85,15 @@ public static class KHW {
         Remove-Item $ad, $la -Recurse -Force -ErrorAction SilentlyContinue
         "smoke: removed the run's data: appdata=$(-not (Test-Path $ad)) localappdata=$(-not (Test-Path $la))"
     }
+}
+if ($ok -and $EvalList) {
+    $tests = Join-Path $src '_build\Release\tests\KHRadioTests.exe'
+    $csv = Join-Path $Root 'eval.csv'; $evalOut = Join-Path $Root 'eval-out.txt'
+    $p = Start-Process -FilePath $tests -ArgumentList @('--eval', "`"$EvalList`"", "`"$EvalCache`"", "`"$csv`"") -NoNewWindow -PassThru -RedirectStandardOutput $evalOut -RedirectStandardError "$evalOut.err"
+    $null = $p.Handle
+    if (-not $p.WaitForExit(900000)) { & taskkill.exe /PID $p.Id /T /F | Out-Null; 'eval: TIMED OUT after 15 min'; $ok = $false }
+    Get-Content $evalOut, "$evalOut.err" -ErrorAction SilentlyContinue | Select-Object -First 12
+    if ($p.HasExited -and $p.ExitCode -ne 0) { $ok = $false }
 }
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 "REMOTE VERDICT: $(if ($ok) { 'PASS' } else { 'FAIL' })"

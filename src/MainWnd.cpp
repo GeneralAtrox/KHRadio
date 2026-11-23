@@ -36,6 +36,10 @@ namespace
 	CStringW QueueText(const QueueItem& item)
 	{
 		CStringW s = item.label;
+		if (item.IsSkipped()) {
+			// the filter passes over it: say why, so it can be played anyway
+			s += CStringW(L"   (skipped: ") + SkipReasonText(item.skip) + L")";
+		}
 		if (!item.ref.albumTitle.IsEmpty()) {
 			s += L"   \x2014   " + item.ref.albumTitle;
 		}
@@ -412,9 +416,13 @@ void CMainWnd::OnDrawItem(int id, LPDRAWITEMSTRUCT dis)
 	const bool selected = !!(dis->itemState & ODS_SELECTED);
 
 	dc->FillSolidRect(r, selected ? p.selBk : p.listBk);
+	const QueueItem* qi = m_player.Item(item);
+	const bool skipped = qi && qi->IsSkipped();
 	COLORREF color = p.listText;
 	if (selected) {
 		color = p.selText;
+	} else if (skipped) {
+		color = p.disabled; // dimmed: the filter passes over it
 	} else if (item == current) {
 		color = p.accent;
 	} else if (item < current) {
@@ -516,8 +524,7 @@ void CMainWnd::OnPaint()
 	// queue heading
 	dc.SelectObject(&m_fontUIBold);
 	CStringW heading;
-	const int total = static_cast<int>(m_player.Queue().size());
-	const int ahead = cur ? total - m_player.CurrentIndex() - 1 : total;
+	const int ahead = CountPlayableAfter(m_player.Queue(), cur ? m_player.CurrentIndex() : -1);
 	heading.Format(L"Queue - %d up next (double-click to jump)", std::max(0, ahead));
 	dc.DrawTextW(heading, CRect(m_rcQueueLabel), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 	dc.SelectObject(oldFont);
@@ -591,9 +598,28 @@ void CMainWnd::OnQueueDblClk()
 {
 	const int sel = m_queue.GetCurSel();
 	if (sel != LB_ERR) {
+		const QueueItem* item = m_player.Item(sel);
+		if (item && item->IsSkipped()) {
+			m_dlg.SetStatus(CStringW(L"Skipped by the filter: ") + SkipReasonText(item->skip)
+				+ L". Right-click it and choose \x201CPlay anyway\x201D to hear it.");
+			return;
+		}
 		m_dlg.CancelSharedLink();
 		m_player.PlayIndex(sel);
 	}
+}
+
+void CMainWnd::PlayAnyway(int index)
+{
+	const QueueItem* item = m_player.Item(index);
+	if (!item || !item->IsSkipped()) {
+		return;
+	}
+	KHLog::Format(L"filter: 'Play anyway' on '%s' (was skipped: %s)", item->ref.name.GetString(), SkipReasonKey(item->skip));
+	KHRadioData::AddKept(item->pageUrl); // the filter leaves this track alone from now on
+	m_player.Unskip(index);
+	m_dlg.CancelSharedLink();
+	m_player.PlayIndex(index);
 }
 
 void CMainWnd::ShareText(const CStringW& text, LPCWSTR what)
@@ -656,11 +682,16 @@ void CMainWnd::OnContextMenu(CWnd* wnd, CPoint pt)
 	const QueueItem copy = *item;
 	CMenu menu;
 	menu.CreatePopupMenu();
+	if (copy.IsSkipped()) {
+		menu.AppendMenuW(MF_STRING, 3, L"Play anyway");
+		menu.AppendMenuW(MF_SEPARATOR, 0, static_cast<LPCWSTR>(nullptr));
+	}
 	menu.AppendMenuW(MF_STRING | (KHShare::TrackPageFor(copy.pageUrl, copy.ref.albumUrl, copy.audioUrl).IsEmpty() ? MF_GRAYED : 0), 1, L"Share this track");
 	menu.AppendMenuW(MF_STRING, 2, L"Share this album");
 	switch (menu.TrackPopupMenu(TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, this)) {
 		case 1: ShareText(KHShare::TrackShareText(copy.ref.name, copy.ref.albumTitle, KHShare::TrackPageFor(copy.pageUrl, copy.ref.albumUrl, copy.audioUrl)), L"track"); break;
 		case 2: ShareText(KHShare::AlbumShareText(copy.ref.albumTitle, copy.ref.albumUrl), L"album"); break;
+		case 3: PlayAnyway(m_player.FindById(copy.id)); break;
 		default: break;
 	}
 }
@@ -833,6 +864,18 @@ void CMainWnd::RefreshQueueList()
 	while (same < queue.size() && same < m_listedIds.size() && queue[same].id == m_listedIds[same]) {
 		same++;
 	}
+	// rows whose skipped state changed get their text (read by screen readers) rewritten
+	for (size_t i = 0; i < same && i < m_listedSkips.size(); i++) {
+		if (queue[i].skip != m_listedSkips[i]) {
+			const int sel = m_queue.GetCurSel();
+			m_queue.DeleteString(static_cast<UINT>(i));
+			m_queue.InsertString(static_cast<int>(i), QueueText(queue[i]));
+			m_listedSkips[i] = queue[i].skip;
+			if (sel == static_cast<int>(i)) {
+				m_queue.SetCurSel(sel);
+			}
+		}
+	}
 	if (same != queue.size() || same != m_listedIds.size()) {
 		const int top = m_queue.GetTopIndex();
 		const int sel = m_queue.GetCurSel();
@@ -842,9 +885,11 @@ void CMainWnd::RefreshQueueList()
 			m_queue.DeleteString(static_cast<UINT>(i));
 		}
 		m_listedIds.resize(same);
+		m_listedSkips.resize(same);
 		for (size_t i = same; i < queue.size(); i++) {
 			m_queue.AddString(QueueText(queue[i]));
 			m_listedIds.push_back(queue[i].id);
+			m_listedSkips.push_back(queue[i].skip);
 		}
 		if (selId) {
 			m_queue.SetCurSel(m_player.FindById(selId));

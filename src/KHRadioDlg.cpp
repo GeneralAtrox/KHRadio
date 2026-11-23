@@ -123,9 +123,6 @@ static const KHOption s_khPlatforms[] = {
 // total albums to keep in the queue (the one playing + ones queued ahead)
 #define KHRADIO_QUEUE_DEPTH 2
 
-// "Filter non-music tracks" drops tracks shorter than this (seconds)
-#define KHRADIO_MIN_TRACK_SEC 30
-
 // one-shot timer fired shortly after boot: if there's nothing to resume,
 // auto-start a fresh random album so the user never has to press the button.
 #define KHRADIO_AUTOSTART_TIMER 0xA1
@@ -170,9 +167,9 @@ namespace
 		bool bAppend = false;
 		bool shared = false;      // a pasted share link asked for this album
 		CStringW startAt;         // ... starting at this track (KHShare track key), if any
-		KHInsider::Album album;   // only the tracks that passed the filters
+		KHInsider::Album album;
+		std::vector<SkipReason> skips; // per track: why the filter passes over it (short, title)
 		CStringW coverPath;       // the cached cover, if it is already on disk
-		int skipped = 0;          // tracks dropped as short or spoken
 	};
 
 	struct KHRadioDoneMsg {
@@ -180,8 +177,9 @@ namespace
 		bool bAppend = false;
 		bool failed = false;      // the page fetch failed (status says why)
 		KHInsider::FetchStatus status = KHInsider::FetchStatus::Success;
-		int queued = 0;
-		int skipped = 0;
+		int queued = 0;           // playable tracks
+		int skippedShort = 0;     // tracks the filter passes over: too short
+		int skippedTitle = 0;     // ... the title says drama / voice track
 		CStringW title;
 		CStringW text;            // error to show (empty = success)
 	};
@@ -191,7 +189,7 @@ namespace
 		CStringW coverPath;       // empty: no cover could be fetched
 	};
 
-	enum class ResolveOutcome { Resolved, Filtered, NotFound, Failed, SessionProblem };
+	enum class ResolveOutcome { Resolved, NotFound, Failed, SessionProblem };
 
 	struct KHRadioResolvedMsg {
 		UINT gen = 0;
@@ -199,6 +197,7 @@ namespace
 		ResolveOutcome outcome = ResolveOutcome::Failed;
 		CStringW audioUrl;
 		CStringW name;
+		KHAudio::Decision decision; // the talking-track check (not judged when the filter is off)
 	};
 
 	struct KHRadioResolveDoneMsg {
@@ -209,7 +208,6 @@ namespace
 	enum class PrepareOutcome {
 		Ready,     // the file is in the cache
 		Stream,    // play the address itself (not Vorbis, decode failed, too long)
-		Filtered,  // spoken or silent, with the filter on
 		NoRoom,    // the cache is full of upcoming tracks: try again later
 		Failed,    // the download failed
 	};
@@ -220,6 +218,7 @@ namespace
 		PrepareOutcome outcome = PrepareOutcome::Failed;
 		CStringW path;
 		CStringW name;
+		KHAudio::Decision decision; // the talking-track check of the decoded Ogg
 	};
 
 	template <class T>
@@ -302,6 +301,8 @@ struct CKHRadioDlg::FetchParams {
 	CStringW albumUrl;
 	bool bAvoidPlayed = false;
 	bool bFilterSpoken = false;
+	int minTrackSeconds = 10;           // shorter tracks are skipped while the filter is on
+	KHRadioData::KeepList kept;         // tracks the user chose "Play anyway" on
 	bool bExclusive = false;            // only keep albums exclusive to the selected console(s)
 	bool shared = false;                // a pasted share link
 	CStringW startAt;                   // its track (KHShare track key): never filtered out
@@ -315,7 +316,7 @@ struct CKHRadioDlg::ResolveParams {
 		UINT64 id = 0;
 		CStringW pageUrl;
 		CStringW name;
-		bool keep = false;   // the shared track: the spoken filter leaves it alone
+		bool keep = false;   // the shared track, or "Play anyway": the filter leaves it alone
 	};
 	HWND hWnd = nullptr;
 	UINT gen = 0;
@@ -1218,6 +1219,8 @@ void CKHRadioDlg::StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppen
 	p->startAt = startAt;
 	p->bAvoidPlayed = (m_checkAvoidPlayed.GetCheck() == BST_CHECKED);
 	p->bFilterSpoken = (m_checkFilterSpoken.GetCheck() == BST_CHECKED);
+	p->minTrackSeconds = KHRadioData::Get().minTrackSeconds;
+	p->kept = KHRadioData::Kept();
 	p->bExclusive = (m_checkExclusive.GetCheck() == BST_CHECKED);
 	p->coverDir = KHRadioData::CoverDir();
 
@@ -1308,6 +1311,9 @@ int CKHRadioDlg::CountQueuedAlbums() const
 	int albums = 0;
 	CStringW last;
 	for (size_t i = start; i < queue.size(); i++) {
+		if (queue[i].IsSkipped()) {
+			continue; // an album the filter emptied doesn't keep the radio going
+		}
 		if (albums == 0 || queue[i].ref.albumUrl.CompareNoCase(last) != 0) {
 			albums++;
 			last = queue[i].ref.albumUrl;
@@ -1379,7 +1385,8 @@ void CKHRadioDlg::FetchThread(std::unique_ptr<FetchParams> p)
 
 	KHInsider::FetchStatus fetchStatus = KHInsider::FetchStatus::NetworkError;
 	bool failed = false;
-	int skipped = 0;
+	int skippedShort = 0, skippedTitle = 0;
+	std::vector<SkipReason> chosenSkips;
 	KHInsider::Album chosen;
 	bool have = false;
 
@@ -1419,41 +1426,50 @@ void CKHRadioDlg::FetchThread(std::unique_ptr<FetchParams> p)
 
 		// whole-album spoken filter: drama / voice albums are entirely spoken,
 		// so skip the album by title
-		if (!p->bDirect && p->bFilterSpoken && KHInsider::IsSpokenTitle(album.title) && !lastTry) {
-			KHLog::Format(L"spoken-album: '%s' -> rerolling", album.title.GetString());
+		CStringW albumCue;
+		if (!p->bDirect && p->bFilterSpoken && KHInsider::IsSpokenTitle(album.title, &albumCue) && !lastTry) {
+			KHLog::Format(L"filter: album '%s' says '%s' -> a drama / voice album, rerolling", album.title.GetString(), albumCue.GetString());
 			CStringW status;
 			status.Format(L"'%s' is a drama/voice album - rerolling...", album.title.GetString());
 			postText(status);
 			continue;
 		}
 
-		// cheap per-track filter from the album page itself: very short tracks
-		// and spoken titles. The audio check runs later, track by track.
-		int dropped = 0;
-		if (p->bFilterSpoken) {
-			auto& tracks = album.tracks;
-			tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [&](const KHInsider::Track& t) {
-				if (!p->startAt.IsEmpty() && KHShare::TrackKeyOf(t.pageUrl) == p->startAt) {
-					return false; // the track someone shared plays whatever the filter says
-				}
-				const bool drop = (t.durationSec > 0 && t.durationSec < KHRADIO_MIN_TRACK_SEC) || KHInsider::IsSpokenTitle(t.name);
-				if (drop) {
-					KHLog::Format(L"skip short/spoken track '%s'", t.name.GetString());
-					dropped++;
-				}
-				return drop;
-			}), tracks.end());
+		// cheap per-track checks from the album page itself: very short tracks and
+		// titles that say drama / voice track. They stay queued as skipped rows; the
+		// audio check runs later, a few tracks ahead of playback.
+		std::vector<SkipReason> skips(album.tracks.size(), SkipReason::None);
+		int nShort = 0, nTitle = 0, playable = 0;
+		for (size_t t = 0; t < album.tracks.size(); t++) {
+			const auto& track = album.tracks[t];
+			const bool exempt = !p->bFilterSpoken
+				|| (!p->startAt.IsEmpty() && KHShare::TrackKeyOf(track.pageUrl) == p->startAt) // the shared track plays whatever the filter says
+				|| p->kept.count(KHRadioData::KeepKey(track.pageUrl)) > 0;
+			CStringW cue;
+			if (exempt) {
+			} else if (KHInsider::IsShortTrack(track.durationSec, p->minTrackSeconds)) {
+				skips[t] = SkipReason::Short;
+				nShort++;
+				KHLog::Format(L"filter: '%s' is %d s (under %d s) -> SKIP (short)", track.name.GetString(), track.durationSec, p->minTrackSeconds);
+			} else if (KHInsider::SpokenTitleCue(track.name, &cue) == KHInsider::TitleCue::Strong) {
+				skips[t] = SkipReason::Title;
+				nTitle++;
+				KHLog::Format(L"filter: '%s' title says '%s' -> SKIP (title)", track.name.GetString(), cue.GetString());
+			}
+			playable += skips[t] == SkipReason::None ? 1 : 0;
 		}
-		skipped = dropped;
+		skippedShort = nShort;
+		skippedTitle = nTitle;
 
-		if (album.tracks.empty()) {
+		if (playable == 0) {
 			if (!p->bDirect && !lastTry) {
-				postText(L"Only short or spoken tracks here - rerolling...");
+				postText(L"Only short or drama / voice tracks here - rerolling...");
 				continue;
 			}
 			break;
 		}
 		chosen = std::move(album);
+		chosenSkips = std::move(skips);
 		have = true;
 		break;
 	}
@@ -1467,7 +1483,8 @@ void CKHRadioDlg::FetchThread(std::unique_ptr<FetchParams> p)
 	done->bAppend = p->bAppend;
 	done->failed = failed;
 	done->status = fetchStatus;
-	done->skipped = skipped;
+	done->skippedShort = skippedShort;
+	done->skippedTitle = skippedTitle;
 	if (failed) {
 		switch (fetchStatus) {
 			case KHInsider::FetchStatus::LoginRequired:
@@ -1487,8 +1504,8 @@ void CKHRadioDlg::FetchThread(std::unique_ptr<FetchParams> p)
 				break;
 		}
 	} else if (!have) {
-		done->text = skipped > 0
-			? CStringW(L"Every track was filtered out - try unchecking 'Filter spoken / short / silent tracks'.")
+		done->text = skippedShort + skippedTitle > 0
+			? CStringW(L"Every track was too short or a drama / voice track - try unchecking 'Filter spoken / short / silent tracks'.")
 			: CStringW(L"No playable tracks found - try different filters.");
 	}
 
@@ -1501,9 +1518,9 @@ void CKHRadioDlg::FetchThread(std::unique_ptr<FetchParams> p)
 		am->shared = p->shared;
 		am->startAt = p->startAt;
 		am->album = chosen;
+		am->skips = chosenSkips;
 		am->coverPath = FileHasData(coverPath) ? coverPath : CStringW();
-		am->skipped = skipped;
-		done->queued = static_cast<int>(chosen.tracks.size());
+		done->queued = static_cast<int>(chosen.tracks.size()) - skippedShort - skippedTitle;
 		done->title = chosen.title;
 		const bool needCover = am->coverPath.IsEmpty();
 		PostOwned(p->hWnd, WM_KHRADIO_ALBUM, std::move(am));
@@ -1529,12 +1546,13 @@ void CKHRadioDlg::KickResolver()
 	}
 	const auto& queue = m_host->Player().Queue();
 	const int start = std::max(0, m_host->Player().CurrentIndex());
+	// the playing track and the next few playable ones; skipped rows don't use up the window
+	const int last = AheadLimit(queue, start, KHRADIO_RESOLVE_AHEAD);
 	auto p = std::make_unique<ResolveParams>();
-	for (int i = start; i < static_cast<int>(queue.size()) && i <= start + KHRADIO_RESOLVE_AHEAD
-			&& p->items.size() < KHRADIO_RESOLVE_BATCH; i++) {
+	for (int i = start; i <= last && p->items.size() < KHRADIO_RESOLVE_BATCH; i++) {
 		const QueueItem& item = queue[static_cast<size_t>(i)];
-		if (!item.IsResolved() && !item.pageUrl.IsEmpty()) {
-			p->items.push_back({ item.id, item.pageUrl, item.ref.name, item.shared });
+		if (!item.IsSkipped() && !item.IsResolved() && !item.pageUrl.IsEmpty()) {
+			p->items.push_back({ item.id, item.pageUrl, item.ref.name, item.shared || item.keep || item.judged });
 		}
 	}
 	if (p->items.empty()) {
@@ -1572,12 +1590,11 @@ void CKHRadioDlg::ResolveThread(std::unique_ptr<ResolveParams> p)
 		KHInsider::FetchStatus status = KHInsider::FetchStatus::NetworkError;
 		const CStringW url = KHInsider::ResolveTrackAudioUrl(item.pageUrl, &status);
 		if (!url.IsEmpty()) {
-			if (p->bFilterSpoken && !item.keep && KHInsider::ClassifyTrackAudio(url, item.name) != KHInsider::AudioVerdict::Music) {
-				msg->outcome = ResolveOutcome::Filtered;
-			} else {
-				msg->outcome = ResolveOutcome::Resolved;
-				msg->audioUrl = url;
+			if (p->bFilterSpoken && !item.keep) {
+				msg->decision = KHInsider::ClassifyTrackAudio(url); // two 256 KB windows; not judged for non-mp3
 			}
+			msg->outcome = ResolveOutcome::Resolved;
+			msg->audioUrl = url;
 		} else {
 			switch (status) {
 				case KHInsider::FetchStatus::LoginRequired:
@@ -1628,12 +1645,14 @@ LRESULT CKHRadioDlg::OnKHRadioResolved(WPARAM, LPARAM lParam)
 	}
 	switch (m->outcome) {
 		case ResolveOutcome::Resolved:
+			// a skipped track keeps its address, so "Play anyway" can start it at once
+			if (m->decision.judged && ApplyAudioCheck(index, m->decision, L"mp3")) {
+				player.Resolve(player.FindById(m->id), m->audioUrl);
+				KickResolver();
+				break;
+			}
 			player.Resolve(index, m->audioUrl);
 			KickPreparer(); // an Ogg track ahead can be decoded now
-			break;
-		case ResolveOutcome::Filtered:
-			KHLog::Format(L"filter: dropped non-music track '%s'", m->name.GetString());
-			player.Remove(index);
 			break;
 		case ResolveOutcome::NotFound:
 			player.Remove(index);
@@ -1696,11 +1715,14 @@ void CKHRadioDlg::KickPreparer()
 		return;
 	}
 	const int cur = std::max(0, player.CurrentIndex());
-	const int last = std::min(static_cast<int>(queue.size()) - 1, cur + KHRADIO_RESOLVE_AHEAD);
+	const int last = AheadLimit(queue, cur, KHRADIO_RESOLVE_AHEAD);
 	int target = -1;
 	bool inFlightNeeded = false;
 	for (int i = cur; i <= last; i++) {
 		const QueueItem& item = queue[static_cast<size_t>(i)];
+		if (item.IsSkipped()) {
+			continue;
+		}
 		if (m_bPreparing && item.id == m_prepareId) {
 			inFlightNeeded = true;
 		}
@@ -1734,7 +1756,7 @@ void CKHRadioDlg::KickPreparer()
 	p->name = item.ref.name;
 	p->mode = item.prepare;
 	p->current = target == cur;
-	p->bFilterSpoken = (m_checkFilterSpoken.GetCheck() == BST_CHECKED) && !item.shared;
+	p->bFilterSpoken = (m_checkFilterSpoken.GetCheck() == BST_CHECKED) && !item.shared && !item.keep && !item.judged;
 	m_bPreparing = true;
 	m_prepareId = item.id;
 	m_prepareStarted = GetTickCount64();
@@ -1809,12 +1831,10 @@ void CKHRadioDlg::PrepareThread(std::unique_ptr<PrepareParams> p)
 	DeleteFileW(download);
 	switch (result) {
 		case KHAudioCache::DecodeResult::Ok:
-			if (p->bFilterSpoken && KHInsider::ClassifyMonoPcm(info.monoPrefix, info.sampleRate, p->name) != KHInsider::AudioVerdict::Music) {
-				DeleteFileW(final);
-				post(PrepareOutcome::Filtered, CStringW());
-			} else {
-				post(PrepareOutcome::Ready, final);
+			if (p->bFilterSpoken) {
+				msg->decision = KHInsider::ClassifyMonoPcm(info.monoPrefix, info.monoMiddle, info.sampleRate);
 			}
+			post(PrepareOutcome::Ready, final);
 			return;
 		case KHAudioCache::DecodeResult::Cancelled:
 			return;
@@ -1854,15 +1874,15 @@ LRESULT CKHRadioDlg::OnKHRadioPrepared(WPARAM, LPARAM lParam)
 	}
 	switch (m->outcome) {
 		case PrepareOutcome::Ready:
+			if (m->decision.judged && ApplyAudioCheck(index, m->decision, L"ogg")) {
+				DeleteFileW(m->path); // prepared again if the user plays it anyway
+				break;
+			}
 			player.Prepared(index, m->path);
 			break;
 		case PrepareOutcome::Stream:
 			KHLog::Format(L"prepare: '%s' could not be decoded here - trying to stream it as before", m->name.GetString());
 			player.Prepared(index, CStringW());
-			break;
-		case PrepareOutcome::Filtered:
-			KHLog::Format(L"filter: dropped non-music track '%s'", m->name.GetString());
-			player.Remove(index);
 			break;
 		case PrepareOutcome::NoRoom:
 			m_prepareRetryAt = GetTickCount64() + KHRADIO_PREPARE_RETRY_MS;
@@ -1900,7 +1920,7 @@ void CKHRadioDlg::PruneCache()
 	std::vector<unsigned long long> keep;
 	unsigned long long protect = 0;
 	if (cur >= 0 && cur < static_cast<int>(queue.size())) {
-		const int last = std::min(static_cast<int>(queue.size()) - 1, cur + KHRADIO_RESOLVE_AHEAD);
+		const int last = AheadLimit(queue, cur, KHRADIO_RESOLVE_AHEAD);
 		for (int i = cur; i <= last; i++) {
 			keep.push_back(queue[static_cast<size_t>(i)].id);
 		}
@@ -1916,6 +1936,36 @@ void CKHRadioDlg::PruneCache()
 			item->localPath.Empty(); // let go: prepared again if it is played again
 		}
 	}
+}
+
+bool CKHRadioDlg::ApplyAudioCheck(int index, const KHAudio::Decision& d, LPCWSTR route)
+{
+	CRadioPlayer& player = m_host->Player();
+	QueueItem* item = player.Item(index);
+	if (!item) {
+		return false;
+	}
+	item->judged = true;
+	CStringW album = item->ref.albumUrl;
+	album.MakeLower();
+	if (m_albumTally.size() > 64 && m_albumTally.find(album) == m_albumTally.end()) {
+		m_albumTally.clear(); // only the albums in the queue matter
+	}
+	KHAudio::AlbumTally& tally = m_albumTally[album];
+	CStringW cueText;
+	const KHInsider::TitleCue cue = KHInsider::SpokenTitleCue(item->ref.name, &cueText);
+	const KHAudio::FilterCall call = KHAudio::ApplyAlbumContext(d, cue, tally);
+	const CStringW name = item->ref.name;
+	KHLog::Format(L"filter (%s): '%s' %s ; title cue: %s ; album so far %d/%d talking -> %s (%s)", route, name.GetString(),
+		KHAudio::Describe(d).GetString(), cue == KHInsider::TitleCue::None ? L"none" : cueText.GetString(),
+		tally.talking, tally.judged, call.skip == SkipReason::None ? L"keep" : L"SKIP", call.rule);
+	tally.Add(d);
+	if (call.skip == SkipReason::None) {
+		return false;
+	}
+	player.MarkSkipped(index, call.skip);
+	SetStatus(L"Skipped '" + name + L"': " + SkipReasonText(call.skip) + L".\r\nRight-click it in the queue to play it anyway.");
+	return true;
 }
 
 LRESULT CKHRadioDlg::OnKHRadioStatus(WPARAM, LPARAM lParam)
@@ -1951,12 +2001,15 @@ LRESULT CKHRadioDlg::OnKHRadioAlbum(WPARAM, LPARAM lParam)
 			startTrack = 0;
 		}
 	}
-	int first = -1;
+	int first = -1, playable = 0;
 	for (size_t t = 0; t < album.tracks.size(); t++) {
 		const auto& track = album.tracks[t];
 		QueueItem item;
 		item.id = NewQueueItemId();
 		item.pageUrl = track.pageUrl;
+		item.skip = t < m->skips.size() ? m->skips[t] : SkipReason::None;
+		item.keep = KHRadioData::IsKept(track.pageUrl);
+		playable += item.IsSkipped() ? 0 : 1;
 		item.label.Format(L"%02d. %s", track.number, track.name.GetString());
 		item.ref = { track.name, album.url, album.title, m->coverPath, album.platforms };
 		item.shared = m->shared && !m->startAt.IsEmpty() && m_shareNotice.IsEmpty() && static_cast<int>(t) == startTrack;
@@ -1966,7 +2019,8 @@ LRESULT CKHRadioDlg::OnKHRadioAlbum(WPARAM, LPARAM lParam)
 		}
 	}
 	// Jump-start only for a new album or when playback genuinely ran dry; a
-	// paused or loading player keeps what it is doing.
+	// paused or loading player keeps what it is doing. A skipped first track
+	// starts at the next playable one.
 	if (first >= 0 && (!m->bAppend || ranDry)) {
 		player.PlayIndex(first);
 	}
@@ -1975,8 +2029,8 @@ LRESULT CKHRadioDlg::OnKHRadioAlbum(WPARAM, LPARAM lParam)
 	}
 
 	CStringW status;
-	status.Format(m->bAppend ? L"Up next: %s (%u tracks)" : L"Found: %s (%u tracks) - starting...",
-		album.title.GetString(), static_cast<unsigned>(album.tracks.size()));
+	status.Format(m->bAppend ? L"Up next: %s (%d tracks)" : L"Found: %s (%d tracks) - starting...",
+		album.title.GetString(), playable);
 	if (!album.platforms.IsEmpty()) {
 		status.AppendFormat(L"\r\nPlatforms: %s", album.platforms.GetString());
 	}
@@ -2002,8 +2056,15 @@ LRESULT CKHRadioDlg::OnKHRadioDone(WPARAM, LPARAM lParam)
 		KHLog::Format(L"done: append=%d queued=%d tracks -> albums queued=%d", m->bAppend ? 1 : 0, m->queued, CountQueuedAlbums());
 		CStringW status;
 		status.Format(m->bAppend ? L"Queued next: %s" : L"Playing: %s", m->title.GetString());
-		if (m->skipped > 0) {
-			status.AppendFormat(L"  (skipped %d short or spoken)", m->skipped);
+		if (m->skippedShort + m->skippedTitle > 0) {
+			status.AppendFormat(L"  (%d skipped:", m->skippedShort + m->skippedTitle);
+			if (m->skippedShort) {
+				status.AppendFormat(L" %d too short", m->skippedShort);
+			}
+			if (m->skippedTitle) {
+				status.AppendFormat(L"%s %d titled drama / voice", m->skippedShort ? L"," : L"", m->skippedTitle);
+			}
+			status += L")";
 		}
 		if (!m->bAppend && !m_shareNotice.IsEmpty()) {
 			status += L"\r\n" + m_shareNotice;

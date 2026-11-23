@@ -21,6 +21,7 @@
 #include "FileUtil.h"
 #include "Log.h"
 #include "KHInsider.h"
+#include "AudioClassify.h"
 
 #include <shlobj.h>
 #include <winhttp.h>
@@ -31,12 +32,6 @@
 #include <mutex>
 #include <string>
 
-#pragma warning(push, 0)
-#pragma warning(disable: 4146 4244 4267 4456 4457 4701 4703)
-#define MINIMP3_IMPLEMENTATION
-#define MINIMP3_NO_STDIO
-#include "minimp3/minimp3.h"
-#pragma warning(pop)
 
 #define KHINSIDER_BASE L"https://downloads.khinsider.com"
 
@@ -261,6 +256,8 @@ namespace KHInsider
 		bool overflow = false;
 		bool truncated = false;
 		bool writeFailed = false;
+		unsigned long long total = 0; // whole file size from a 206 reply's Content-Range
+		bool partial = false;         // the reply was 206 Partial Content
 		const std::function<bool()>* cancelled = nullptr;
 
 		bool Cancelled() const { return g_shuttingDown || (cancelled && *cancelled && (*cancelled)()); }
@@ -268,7 +265,8 @@ namespace KHInsider
 		bool Reset()
 		{
 			size = 0;
-			overflow = truncated = writeFailed = false;
+			total = 0;
+			overflow = truncated = writeFailed = partial = false;
 			if (data) {
 				data->clear();
 			}
@@ -425,6 +423,17 @@ namespace KHInsider
 						DWORD dwLen = sizeof(dwStatus);
 						WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
 											WINHTTP_HEADER_NAME_BY_INDEX, &dwStatus, &dwLen, WINHTTP_NO_HEADER_INDEX);
+						if (dwStatus == 206) {
+							// "bytes 0-262143/5242880": the size after the slash places the middle window
+							sink.partial = true;
+							WCHAR cr[128] = {};
+							DWORD crLen = sizeof(cr);
+							if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX, cr, &crLen, WINHTTP_NO_HEADER_INDEX)) {
+								if (const wchar_t* slash = wcschr(cr, L'/')) {
+									sink.total = _wcstoui64(slash + 1, nullptr, 10);
+								}
+							}
+						}
 
 						std::vector<char> tmp(64 * 1024);
 						while (dwStatus < 400) {
@@ -661,76 +670,6 @@ namespace KHInsider
 		return ok;
 	}
 
-	// Spectral-flux threshold separating speech (low flux) from music (high flux).
-	// Calibrated against the Python prototype (same Hann/1024-FFT); recheck via the
-	// debug log if the decode path or sample rate changes.
-	constexpr double KH_FLUX_MAX = 10.0;
-
-	// Small self-contained in-place radix-2 FFT (n must be a power of two).
-	static void KHFFT(double* re, double* im, int n)
-	{
-		constexpr double kPi = 3.14159265358979323846;
-		for (int i = 1, j = 0; i < n; i++) {
-			int bit = n >> 1;
-			for (; j & bit; bit >>= 1) { j ^= bit; }
-			j ^= bit;
-			if (i < j) {
-				std::swap(re[i], re[j]);
-				std::swap(im[i], im[j]);
-			}
-		}
-		for (int len = 2; len <= n; len <<= 1) {
-			const double ang = -2.0 * kPi / len;
-			const double wr = std::cos(ang), wi = std::sin(ang);
-			for (int i = 0; i < n; i += len) {
-				double cr = 1.0, ci = 0.0;
-				for (int k = 0; k < len / 2; k++) {
-					const double pr = re[i + k], pim = im[i + k];
-					const double qr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
-					const double qi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
-					re[i + k] = pr + qr; im[i + k] = pim + qi;
-					re[i + k + len / 2] = pr - qr; im[i + k + len / 2] = pim - qi;
-					const double ncr = cr * wr - ci * wi;
-					ci = cr * wi + ci * wr; cr = ncr;
-				}
-			}
-		}
-	}
-
-	// Mean per-frame change of the magnitude spectrum over the prefix (1024-sample
-	// frames, hop 512, Hann window). Music keeps introducing new notes/timbres
-	// (high flux); speech does not (low flux).
-	static double SpectralFlux(const std::vector<float>& mono)
-	{
-		constexpr int N = 1024, HOP = 512, BINS = N / 2 + 1;
-		constexpr double kPi = 3.14159265358979323846;
-		if (mono.size() < static_cast<size_t>(N) * 4) {
-			return 0.0;
-		}
-		std::vector<double> hann(N);
-		for (int i = 0; i < N; i++) {
-			hann[i] = 0.5 - 0.5 * std::cos(2.0 * kPi * i / (N - 1));
-		}
-		std::vector<double> re(N), im(N), mag(BINS), prev(BINS, 0.0);
-		double fluxSum = 0.0;
-		int frames = 0;
-		bool havePrev = false;
-		for (size_t s = 0; s + N <= mono.size(); s += HOP) {
-			for (int i = 0; i < N; i++) { re[i] = static_cast<double>(mono[s + i]) * hann[i]; im[i] = 0.0; }
-			KHFFT(re.data(), im.data(), N);
-			for (int k = 0; k < BINS; k++) { mag[k] = std::sqrt(re[k] * re[k] + im[k] * im[k]); }
-			if (havePrev) {
-				double d2 = 0.0;
-				for (int k = 0; k < BINS; k++) { const double d = mag[k] - prev[k]; d2 += d * d; }
-				fluxSum += std::sqrt(d2);
-				frames++;
-			}
-			prev = mag;
-			havePrev = true;
-		}
-		return frames > 0 ? fluxSum / frames : 0.0;
-	}
-
 	static bool IsMp3Url(const CStringW& url)
 	{
 		CStringW path = url;
@@ -741,153 +680,33 @@ namespace KHInsider
 		return path.GetLength() > 4 && path.Right(4).CompareNoCase(L".mp3") == 0;
 	}
 
-	// Classify a track as music, spoken, or (near-)silent. First a cheap title
-	// check for spoken content, then a content analysis of a downloaded prefix.
-	// Conservative thresholds favour keeping music; every decision is logged.
-	AudioVerdict ClassifyTrackAudio(const CStringW& audioUrl, const CStringW& trackName)
+	// Two windows of the mp3 (after the ID3 tag, and the middle), fetched with
+	// ranged GETs of 256 KB each, judged by KHAudio. Anything that can't be
+	// fetched or decoded comes back not judged, which counts as music.
+	KHAudio::Decision ClassifyTrackAudio(const CStringW& audioUrl)
 	{
-		constexpr size_t kPrefix = 262144;       // ~256 KB, enough for ~10-15 s
-
-		if (IsSpokenTitle(trackName)) {
-			KHLog::Format(L"audio check '%s': title match -> SPOKEN", trackName.GetString());
-			return AudioVerdict::Spoken;
+		if (!IsMp3Url(audioUrl) || !IsAllowedMediaUrl(audioUrl)) {
+			return {}; // only mp3 is fetched here; ogg is judged by the cache's decode
 		}
-		if (!IsMp3Url(audioUrl)) {
-			return AudioVerdict::Music; // only mp3 can be decoded here -> keep
-		}
-
-		urlData mp3;
-		if (!HttpGetBytes(audioUrl, mp3, kPrefix, true, L"Range: bytes=0-262143\r\n") || mp3.size() < 8192) {
-			return AudioVerdict::Music; // can't analyse -> keep the track
-		}
-
-		// A big ID3v2 tag (embedded cover art) can fill the whole prefix; then
-		// fetch the audio that follows it instead.
-		size_t offset = Id3v2TagSize(reinterpret_cast<const unsigned char*>(mp3.data()), mp3.size());
-		if (offset > 0 && offset + 65536 > mp3.size()) {
-			if (offset > 32u * 1024 * 1024) {
-				return AudioVerdict::Music;
-			}
+		const KHAudio::RangeFetch fetch = [&audioUrl](unsigned long long from, unsigned long long to, KHAudio::RangeReply& reply) {
 			CStringW range;
-			range.Format(L"Range: bytes=%llu-%llu\r\n", static_cast<unsigned long long>(offset),
-				static_cast<unsigned long long>(offset + kPrefix - 1));
-			KHLog::Format(L"audio check '%s': %u-byte ID3 tag - fetching the audio after it", trackName.GetString(), static_cast<unsigned>(offset));
-			if (!HttpGetBytes(audioUrl, mp3, kPrefix, true, range) || mp3.size() < 8192) {
-				return AudioVerdict::Music;
+			range.Format(L"Range: bytes=%llu-%llu\r\n", from, to);
+			Sink sink;
+			sink.data = &reply.data;
+			sink.maxBytes = static_cast<size_t>(to - from + 1);
+			sink.truncateOk = true;
+			if (!HttpGet(audioUrl, sink, range)) {
+				return false;
 			}
-			offset = 0;
-		}
-
-		// decode to mono float PCM
-		mp3dec_t dec;
-		mp3dec_init(&dec);
-		mp3dec_frame_info_t info = {};
-		std::vector<float> mono;
-		const uint8_t* buf = reinterpret_cast<const uint8_t*>(mp3.data()) + offset;
-		int bytesLeft = static_cast<int>(mp3.size() - offset);
-		int hz = 0;
-		std::vector<short> pcm(MINIMP3_MAX_SAMPLES_PER_FRAME);
-		const size_t maxSamples = 30u * 48000u;
-		while (bytesLeft > 0 && mono.size() < maxSamples) {
-			const int samples = mp3dec_decode_frame(&dec, buf, bytesLeft, pcm.data(), &info);
-			if (info.frame_bytes <= 0) {
-				break;
-			}
-			buf += info.frame_bytes;
-			bytesLeft -= info.frame_bytes;
-			if (samples > 0) {
-				hz = info.hz;
-				if (info.channels >= 2) {
-					for (int i = 0; i < samples; i++) {
-						mono.push_back((pcm[2 * i] + pcm[2 * i + 1]) * (0.5f / 32768.0f));
-					}
-				} else {
-					for (int i = 0; i < samples; i++) {
-						mono.push_back(pcm[i] / 32768.0f);
-					}
-				}
-			}
-		}
-
-		return ClassifyMonoPcm(mono, hz, trackName);
+			reply.total = sink.total;
+			reply.partial = sink.partial;
+			return true;
+		};
+		return KHAudio::ClassifyMp3(fetch);
 	}
 
-	AudioVerdict ClassifyMonoPcm(const std::vector<float>& mono, int hz, const CStringW& trackName)
+	KHAudio::Decision ClassifyMonoPcm(const std::vector<float>& first, const std::vector<float>& middle, int hz)
 	{
-		constexpr double kQuietPeakRms = 0.015; // prefix never louder than this -> empty/quiet
-		if (hz <= 0 || mono.size() < static_cast<size_t>(hz)) {
-			return AudioVerdict::Music; // need at least ~1s of audio to judge -> keep
-		}
-
-		// 20 ms frames -> energy envelope (50 fps) and zero-crossing rate
-		const int frameLen = hz / 50;
-		const int nFrames = frameLen > 0 ? static_cast<int>(mono.size() / static_cast<size_t>(frameLen)) : 0;
-		if (frameLen < 1 || nFrames < 25) {
-			return AudioVerdict::Music;
-		}
-
-		std::vector<float> energy(static_cast<size_t>(nFrames)), zcr(static_cast<size_t>(nFrames));
-		double maxE = 0.0;
-		for (int f = 0; f < nFrames; f++) {
-			const float* x = &mono[static_cast<size_t>(f) * frameLen];
-			double e = 0.0;
-			int zc = 0;
-			for (int i = 0; i < frameLen; i++) {
-				e += static_cast<double>(x[i]) * x[i];
-				if (i > 0 && ((x[i] >= 0.0f) != (x[i - 1] >= 0.0f))) {
-					zc++;
-				}
-			}
-			energy[f] = static_cast<float>(std::sqrt(e / frameLen));
-			zcr[f] = static_cast<float>(zc) / frameLen;
-			if (energy[f] > maxE) {
-				maxE = energy[f];
-			}
-		}
-
-		double meanE = 0.0;
-		for (const float e : energy) {
-			meanE += e;
-		}
-		meanE /= nFrames;
-
-		// empty/very quiet: the loudest 20 ms in the whole prefix is still faint
-		if (maxE < kQuietPeakRms) {
-			KHLog::Format(L"audio check '%s': peak=%.4f mean=%.4f -> QUIET", trackName.GetString(), maxE, meanE);
-			return AudioVerdict::Quiet;
-		}
-
-		int pauses = 0;
-		for (const float e : energy) {
-			if (e < 0.25 * meanE) {
-				pauses++;
-			}
-		}
-		const double pauseRatio = static_cast<double>(pauses) / nFrames;
-
-		double meanZ = 0.0;
-		for (const float z : zcr) {
-			meanZ += z;
-		}
-		meanZ /= nFrames;
-		double varZ = 0.0;
-		for (const float z : zcr) {
-			varZ += (z - meanZ) * (z - meanZ);
-		}
-		varZ /= nFrames;
-		const double zcrCoV = meanZ > 1e-6 ? std::sqrt(varZ) / meanZ : 0.0;
-
-		// Spectral flux is the key speech/music discriminator; within the low-flux
-		// zone, real speech also shows either high zero-crossing-rate variance
-		// (continuous dialogue) or a high pause ratio (gappy/dramatic speech).
-		// Validated on 29 labelled tracks (13 spoken / 16 music): 13/13 recall,
-		// 0 false positives.
-		const double flux = SpectralFlux(mono);
-		const bool spoken = (flux < KH_FLUX_MAX) && (zcrCoV > 0.70 || pauseRatio > 0.30);
-
-		KHLog::Format(L"audio check '%s': flux=%.1f pause=%.2f zcrCoV=%.2f peak=%.3f -> %s",
-			trackName.GetString(), flux, pauseRatio, zcrCoV, maxE, spoken ? L"SPOKEN" : L"music");
-
-		return spoken ? AudioVerdict::Spoken : AudioVerdict::Music;
+		return KHAudio::ClassifyPcmWindows(first, middle, hz);
 	}
 }

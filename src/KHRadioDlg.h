@@ -20,10 +20,12 @@
 
 #include <afxwin.h>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <thread>
 #include <vector>
 #include "History.h"
+#include "AudioClassify.h"
 #include "KHInsider.h"
 #include "RadioTypes.h"
 #include "ShareLink.h"
@@ -163,7 +165,10 @@ private:
 	void ShowPreparing(const QueueItem& item);
 	unsigned ScheduleFetchRetry(KHInsider::FetchStatus why); // seconds until it runs (0 = when signed in)
 	void Watchdog();
-	int CountQueuedAlbums() const; // albums from the playing one to the end of the queue
+	int CountQueuedAlbums() const; // albums from the playing one to the end of the queue (playable rows)
+	// Applies the album context to a track's audio decision, logs it, and marks
+	// the track skipped when the filter drops it. True if it was skipped.
+	bool ApplyAudioCheck(int index, const KHAudio::Decision& d, LPCWSTR route);
 	void PopulateFilterLists();
 	void RestoreSelections();
 	void SaveSelections();
@@ -221,6 +226,7 @@ private:
 	bool m_bRadioActive = false;        // a radio session is running
 	CStringW m_currentPlayingAlbum;     // album of the track currently playing
 	std::vector<CStringW> m_coverFetches; // albums with a cover fetch in flight
+	std::map<CStringW, KHAudio::AlbumTally> m_albumTally; // talking-track filter: what each album sounded like so far
 
 	CKHRadioHistory m_history;
 };

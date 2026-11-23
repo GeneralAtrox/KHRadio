@@ -78,6 +78,8 @@ private:
 	void SaveState();
 	void UpdateShareButton();
 	void ShareText(const CStringW& text, LPCWSTR what);
+	// "Play anyway" on a row the filter skipped: remembered, then played.
+	void PlayAnyway(int index);
 
 	CRadioPlayer m_player;
 	CKHRadioDlg m_dlg;
@@ -100,6 +102,7 @@ private:
 	CRect m_rcCover, m_rcTitle, m_rcAlbum, m_rcPlatforms, m_rcElapsed, m_rcTotal, m_rcVolumeIcon, m_rcQueueLabel;
 	UINT m_dpi = 96;
 	std::vector<UINT64> m_listedIds; // queue items shown in the list, in order
+	std::vector<SkipReason> m_listedSkips; // ... and whether each was shown as skipped
 	int m_listedCurrent = -2;
 	int m_tick = 0;
 	ULONGLONG m_lastMediaTick = 0;
