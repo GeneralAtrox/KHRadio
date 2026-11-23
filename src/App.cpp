@@ -19,6 +19,7 @@ public:
 	CKHRadioApp() : CWinApp(L"KH Radio") {}
 	BOOL InitInstance() override;
 	int ExitInstance() override;
+	BOOL PreTranslateMessage(MSG* msg) override;
 
 private:
 	HANDLE m_mutex = nullptr;
@@ -90,6 +91,16 @@ BOOL CKHRadioApp::InitInstance()
 		return FALSE;
 	}
 	return TRUE;
+}
+
+BOOL CKHRadioApp::PreTranslateMessage(MSG* msg)
+{
+	// before the radio panel's own dialog handling sees the key
+	auto* wnd = static_cast<CMainWnd*>(m_pMainWnd);
+	if (wnd && ::IsWindow(wnd->m_hWnd) && wnd->TranslateShortcut(msg)) {
+		return TRUE;
+	}
+	return CWinApp::PreTranslateMessage(msg);
 }
 
 int CKHRadioApp::ExitInstance()

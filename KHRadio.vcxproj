@@ -99,6 +99,7 @@
     <ClCompile Include="src\MainWnd.cpp" />
     <ClCompile Include="src\MediaSession.cpp" />
     <ClCompile Include="src\Player.cpp" />
+    <ClCompile Include="src\ShareLink.cpp" />
     <ClCompile Include="src\UiKit.cpp" />
     <ClCompile Include="thirdparty\stb_vorbis\stb_vorbis.c">
       <CompileAs>CompileAsC</CompileAs>
@@ -117,6 +118,7 @@
     <ClInclude Include="src\KHInsider.h" />
     <ClInclude Include="src\KHParse.h" />
     <ClInclude Include="src\KHRadioDlg.h" />
+    <ClInclude Include="src\ShareLink.h" />
     <ClInclude Include="src\KHRadioLayout.h" />
     <ClInclude Include="src\KHWebSession.h" />
     <ClInclude Include="src\Log.h" />

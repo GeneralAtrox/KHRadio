@@ -26,6 +26,7 @@
 #include "History.h"
 #include "KHInsider.h"
 #include "RadioTypes.h"
+#include "ShareLink.h"
 
 class CRadioPlayer;
 
@@ -79,6 +80,13 @@ public:
 	int GetMinimumHeight() const;
 	void ApplyTheme();
 	void SetStatus(const CStringW& text);
+	// A link pasted by the user: load the album the way a history replay does,
+	// starting at the shared track if there is one. Waits for sign-in like any
+	// other request; anything else the user starts replaces it.
+	void PlaySharedLink(const KHShare::Link& link);
+	// The user did something else (picked a queue row, skipped): drop a shared
+	// link that is still loading or waiting for the session.
+	void CancelSharedLink();
 
 protected:
 	void DoDataExchange(CDataExchange* pDX) override;
@@ -104,6 +112,7 @@ protected:
 	afx_msg void OnSize(UINT type, int cx, int cy);
 	afx_msg LRESULT OnSessionStatus(WPARAM wParam, LPARAM lParam);
 	afx_msg void OnHistoryDblClk();
+	afx_msg void OnContextMenu(CWnd* pWnd, CPoint pt);
 	afx_msg LRESULT OnKHRadioStatus(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnKHRadioAlbum(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnKHRadioResolved(WPARAM wParam, LPARAM lParam);
@@ -142,7 +151,8 @@ private:
 	std::vector<Worker> m_workers;
 
 	void Relayout(int cx, int cy);
-	void StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppend = false);
+	// shared: the request came from a pasted link; startAt: its track (see KHShare::Link::trackKey)
+	void StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppend = false, bool shared = false, const CStringW& startAt = CStringW());
 	void StartCoverFetch(const CStringW& albumUrl);  // fetch just the cover for a resumed/restored album
 	void MaybePrefetchNext(); // keep KHRADIO_QUEUE_DEPTH albums queued ahead
 	void KickResolver();      // look up audio for the next few unresolved tracks
@@ -187,10 +197,15 @@ private:
 	bool m_pendingDirect = false;
 	bool m_pendingAppend = false;
 	CStringW m_pendingUrl;
+	bool m_pendingShared = false;
+	CStringW m_pendingStartAt;
 	// the fetch in flight, so a failure can be retried as it was asked
 	bool m_fetchDirect = false;
 	bool m_fetchAppend = false;
 	CStringW m_fetchUrl;
+	bool m_fetchShared = false;
+	CStringW m_fetchStartAt;
+	CStringW m_shareNotice;          // shown with the first track of a shared album (track not found)
 	bool m_sessionNotice = false;    // the status line shows a session problem
 	void RunPendingFetch();
 

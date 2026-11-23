@@ -75,6 +75,7 @@
     <ClCompile Include="..\src\KHParse.cpp" />
     <ClCompile Include="..\src\KHWebSession.cpp" />
     <ClCompile Include="..\src\Log.cpp" />
+    <ClCompile Include="..\src\ShareLink.cpp" />
     <ClCompile Include="..\thirdparty\stb_vorbis\stb_vorbis.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>

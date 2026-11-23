@@ -69,11 +69,12 @@ private:
 	bool m_dragging = false;
 };
 
-// Owner-drawn round button showing one Segoe MDL2 Assets glyph.
+// Owner-drawn round button showing one Segoe MDL2 Assets glyph. 'name' is the
+// window text: not drawn, but read out by screen readers.
 class CGlyphButton : public CButton
 {
 public:
-	BOOL Create(CWnd* parent, UINT id, wchar_t glyph, bool primary);
+	BOOL Create(CWnd* parent, UINT id, wchar_t glyph, bool primary, LPCWSTR name = nullptr);
 	void SetGlyph(wchar_t glyph);
 	void SetGlyphFont(CFont* font) { m_font = font; }
 

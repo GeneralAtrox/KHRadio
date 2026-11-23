@@ -271,11 +271,11 @@ void CSliderBar::OnKeyDown(UINT ch, UINT rep, UINT flags)
 
 // CGlyphButton
 
-BOOL CGlyphButton::Create(CWnd* parent, UINT id, wchar_t glyph, bool primary)
+BOOL CGlyphButton::Create(CWnd* parent, UINT id, wchar_t glyph, bool primary, LPCWSTR name)
 {
 	m_glyph = glyph;
 	m_primary = primary;
-	return CButton::Create(L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, CRect(0, 0, 10, 10), parent, id);
+	return CButton::Create(name ? name : L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, CRect(0, 0, 10, 10), parent, id);
 }
 
 void CGlyphButton::SetGlyph(wchar_t glyph)
@@ -297,6 +297,7 @@ void CGlyphButton::DrawItem(LPDRAWITEMSTRUCT dis)
 
 	const bool pressed = !!(dis->itemState & ODS_SELECTED);
 	const bool focus = !!(dis->itemState & ODS_FOCUS);
+	const bool disabled = !!(dis->itemState & ODS_DISABLED);
 	const int d = std::min(r.Width(), r.Height()) - 2;
 	CRect circle(CPoint(r.left + (r.Width() - d) / 2, r.top + (r.Height() - d) / 2), CSize(d, d));
 
@@ -314,7 +315,7 @@ void CGlyphButton::DrawItem(LPDRAWITEMSTRUCT dis)
 
 	CFont* oldFont = m_font ? dc->SelectObject(m_font) : nullptr;
 	dc->SetBkMode(TRANSPARENT);
-	dc->SetTextColor(m_primary ? RGB(255, 255, 255) : p.text);
+	dc->SetTextColor(disabled ? p.disabled : (m_primary ? RGB(255, 255, 255) : p.text));
 	wchar_t text[2] = { m_glyph, 0 };
 	dc->DrawTextW(text, 1, circle, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	if (oldFont) {

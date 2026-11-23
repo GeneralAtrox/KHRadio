@@ -27,3 +27,5 @@
 #define IDC_KHRADIO_PLAYPAUSE           22203
 #define IDC_KHRADIO_NEXT                22204
 #define IDC_KHRADIO_QUEUE               22205
+#define IDC_KHRADIO_SHARE               22206
+#define IDC_KHRADIO_PLAYSHARED          22207

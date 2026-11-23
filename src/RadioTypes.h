@@ -21,6 +21,7 @@ struct QueueItem {
 	CStringW label;            // "NN. Track name"
 	TrackRef ref;
 	int      resolveFailures = 0;
+	bool     shared = false;   // the track a pasted share link asked for: never filtered out (not saved)
 
 	// How the item is played. Ogg is decoded to a WAV in the app's own cache
 	// folder; an m4a whose stream fails is downloaded there as it is. The player

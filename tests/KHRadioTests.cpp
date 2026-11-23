@@ -1,4 +1,5 @@
 // KH Radio - tests. Offline by default: the parser on small hand-written pages,
+// share links (building, finding them in pasted text, refusing lookalikes),
 // response classification, retry delays, layout geometry, history files and the
 // browser session's shutdown. Opt-in live checks against downloads.khinsider.com:
 //   KHRadioTests --live     the saved sign-in (if any) reaches the site
@@ -11,6 +12,7 @@
 #include "KHParse.h"
 #include "KHRadioLayout.h"
 #include "KHWebSession.h"
+#include "ShareLink.h"
 
 #include <chrono>
 #include <cmath>
@@ -531,6 +533,149 @@ static void TestHelpers()
 	CHECK(AlbumExclusiveTo(L"", { L"Saturn" }));
 }
 
+static void TestShareLinks()
+{
+	using KHShare::Link;
+	using KHShare::LinkKind;
+	const CStringW album = L"https://downloads.khinsider.com/game-soundtracks/album/test-album";
+	const CStringW track = album + L"/01%2520Opening.mp3";
+	Link link;
+
+	// build -> parse round trip
+	const CStringW text = KHShare::TrackShareText(L"Opening", L"Test Album", track);
+	CHECK(text == L"Opening \x2014 Test Album\r\n" + track);
+	CHECK(KHShare::FindLink(text, link) && link.kind == LinkKind::Track && link.albumUrl == album && link.trackKey == L"01 opening.mp3");
+	const CStringW albumText = KHShare::AlbumShareText(L"Test Album", album);
+	CHECK(albumText == L"Test Album\r\n" + album);
+	CHECK(KHShare::FindLink(albumText, link) && link.kind == LinkKind::Album && link.albumUrl == album && link.trackKey.IsEmpty());
+	CHECK(KHShare::TrackShareText(L"a", L"b", L"http://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3?x=1#t") == L"a \x2014 b\r\n" + track);
+	CHECK(KHShare::TrackShareText(L"Two\r\nlines", L"", track) == L"Two  lines\r\n" + track);
+
+	// a queue item restored without its page address: rebuilt from album + audio file
+	const CStringW audio = L"https://vgmtreasurechest.com/soundtracks/test-album/abcdefgh/01%20Opening.mp3";
+	CHECK(KHShare::TrackPageFor(track, album, audio) == track);
+	CHECK(KHShare::TrackPageFor(L"", album, audio) == track);
+	CHECK(KHShare::TrackPageFor(L"", album, audio + L"?t=1") == track);
+	CHECK(KHShare::TrackPageFor(L"", album, L"").IsEmpty());
+	CHECK(KHShare::TrackPageFor(L"", L"", audio).IsEmpty());
+	CHECK(KHShare::TrackPageFor(L"", L"https://evil.example/game-soundtracks/album/test-album", audio).IsEmpty());
+	CHECK(KHShare::TrackKeyOf(KHShare::TrackPageFor(L"", album, audio)) == L"01 opening.mp3");
+	// only KHInsider pages are ever shared: never audio files on the CDN
+	CHECK(KHShare::TrackShareText(L"a", L"b", L"https://jetta.vgmtreasurechest.com/soundtracks/test-album/abcd/01.mp3").IsEmpty());
+	CHECK(KHShare::TrackShareText(L"a", L"b", album).IsEmpty());
+	CHECK(KHShare::AlbumShareText(L"b", track).IsEmpty());
+	CHECK(KHShare::AlbumShareText(L"b", L"").IsEmpty());
+
+	// messy pasted text: the track is found in each
+	const LPCWSTR messyTrack[] = {
+		L"hey listen to this https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3 so good",
+		L"<https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3>",
+		L"Check it out: https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3.",
+		L"(https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3)!",
+		L"http://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3",
+		L"www.downloads.khinsider.com/game-soundtracks/album/test-album/01%20Opening.mp3",
+		L"downloads.khinsider.com/game-soundtracks/album/test-album/01%20Opening.mp3, enjoy",
+		L"HTTPS://DOWNLOADS.KHINSIDER.COM/GAME-SOUNDTRACKS/ALBUM/test-album/01%2520Opening.mp3",
+		L"https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3?utm_source=chat#t=10",
+		L"[Opening](https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3)",
+		L"[https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3](https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3)",
+		L"<https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3|Opening>",
+		L"\"https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3\"",
+		L"**https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3**",
+		L"\x3053\x308Chttps://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3\x3002",
+		L"skip https://evil.example/?u=https://downloads.khinsider.com/game-soundtracks/album/other/x.mp3 and "
+			L"https://downloads.khinsider.com.evil.example/game-soundtracks/album/other then\r\n"
+			L"https://downloads.khinsider.com/game-soundtracks/album/test-album/01%2520Opening.mp3",
+	};
+	for (const auto t : messyTrack) {
+		const bool found = KHShare::FindLink(t, link);
+		CHECK(found && link.kind == LinkKind::Track && link.albumUrl == album && link.trackKey == L"01 opening.mp3");
+		if (!found || link.albumUrl != album) {
+			fprintf(stderr, "  (text: %ls)\n", t);
+		}
+	}
+	const LPCWSTR messyAlbum[] = {
+		L"https://downloads.khinsider.com/game-soundtracks/album/test-album/",
+		L"See https://downloads.khinsider.com/game-soundtracks/album/test-album?page=2.",
+		L"https://downloads.khinsider.com/game-soundtracks/album/test%2Dalbum",
+		L"album: <downloads.khinsider.com/game-soundtracks/album/test-album>",
+	};
+	for (const auto t : messyAlbum) {
+		CHECK(KHShare::FindLink(t, link) && link.kind == LinkKind::Album && link.albumUrl == album);
+	}
+
+	// lookalikes, other schemes and other paths are refused before anything is fetched
+	const LPCWSTR refused[] = {
+		L"https://downloads.khinsider.com.evil.example/game-soundtracks/album/test-album",
+		L"https://khinsider.com@evil.example/game-soundtracks/album/test-album",
+		L"https://downloads.khinsider.com@evil.example/game-soundtracks/album/test-album",
+		L"https://user:pw@downloads.khinsider.com/game-soundtracks/album/test-album",
+		L"https://evil.example/downloads.khinsider.com/game-soundtracks/album/test-album",
+		L"https://downloads.khinsider.com:8080/game-soundtracks/album/test-album",
+		L"https://khinsider.com/game-soundtracks/album/test-album",
+		L"https://notdownloads.khinsider.com/game-soundtracks/album/test-album",
+		L"https://downloads.khinsider.co/game-soundtracks/album/test-album",
+		L"ftp://downloads.khinsider.com/game-soundtracks/album/test-album",
+		L"file://downloads.khinsider.com/game-soundtracks/album/test-album",
+		L"javascript:alert(1)//downloads.khinsider.com/game-soundtracks/album/test-album",
+		L"https://downloads.khinsider.com/game-soundtracks/browse/A",
+		L"https://downloads.khinsider.com/game-soundtracks/album/",
+		L"https://downloads.khinsider.com/game-soundtracks/album/a/b/c",
+		L"https://downloads.khinsider.com/game-soundtracks/album/..%2Fsecret",
+		L"https://downloads.khinsider.com/game-soundtracks/album//x.mp3",
+		L"https://downloads.khinsider.com\\game-soundtracks/album/test-album",
+		L"https://jetta.vgmtreasurechest.com/soundtracks/test-album/abcd/01.mp3",
+		L"no link here",
+		L"",
+	};
+	for (const auto t : refused) {
+		const bool found = KHShare::FindLink(t, link);
+		CHECK(!found && link.kind == LinkKind::None && link.albumUrl.IsEmpty());
+		if (found) {
+			fprintf(stderr, "  (accepted: %ls)\n", t);
+		}
+	}
+	CHECK(!KHShare::ParseLink(L"https://downloads.khinsider.com.evil.example/game-soundtracks/album/x", link));
+	CHECK(!KHShare::ParseLink(L"https://downloads.khinsider.com/game-soundtracks/album/test-album/..", link)); // in pasted text ".." reads as punctuation
+	CHECK(!KHShare::ParseLink(L" https://downloads.khinsider.com/game-soundtracks/album/x", link));
+
+	// album or track
+	CHECK(KHShare::ParseLink(album, link) && link.kind == LinkKind::Album);
+	CHECK(KHShare::ParseLink(album + L"/", link) && link.kind == LinkKind::Album);
+	CHECK(KHShare::ParseLink(track, link) && link.kind == LinkKind::Track);
+	CHECK(KHShare::ParseLink(track + L"/", link) && link.kind == LinkKind::Track);
+	CHECK(KHShare::TrackKeyOf(album).IsEmpty());
+
+	// finding the shared track on the album page, however its name was encoded
+	std::vector<Track> tracks(3);
+	tracks[0].pageUrl = album + L"/01%2520Opening.mp3";
+	tracks[1].pageUrl = album + L"/02%2520Stage%25201%2520%2528Forest%2529.mp3";
+	tracks[2].pageUrl = album + L"/03%2520%25E3%2583%259C.mp3";
+	const auto find = [&](const CStringW& url) {
+		Link l;
+		return KHShare::ParseLink(url, l) ? KHShare::FindTrack(tracks, l.trackKey) : -2;
+	};
+	CHECK(find(album + L"/01%2520Opening.mp3") == 0);
+	CHECK(find(album + L"/01%20OPENING.MP3") == 0);
+	CHECK(find(album + L"/02%20Stage%201%20(Forest).mp3") == 1);
+	CHECK(find(album + L"/02 Stage 1 (Forest).mp3") == 1);
+	CHECK(find(album + L"/02%252520Stage%2525201%252520%252528Forest%252529.mp3") == 1); // encoded once more
+	CHECK(find(album + L"/03%20%E3%83%9C.mp3") == 2);
+	CHECK(find(album + L"/03%2520%25E3%2583%259C.mp3") == 2);
+	CHECK(find(album + L"/03 \x30DC.mp3") == 2);
+	CHECK(find(album + L"/09%2520Gone.mp3") == -1);
+	CHECK(KHShare::FindTrack(tracks, L"") == -1);
+
+	// and on a parsed album page: share each track, find it again
+	Album parsed;
+	CHECK(ParseAlbumPage(Fixture(L"album.html"), album, parsed, nullptr));
+	for (size_t i = 0; i < parsed.tracks.size(); i++) {
+		Link l;
+		CHECK(KHShare::FindLink(KHShare::TrackShareText(parsed.tracks[i].name, parsed.title, parsed.tracks[i].pageUrl), l)
+			&& l.albumUrl == album && KHShare::FindTrack(parsed.tracks, l.trackKey) == static_cast<int>(i));
+	}
+}
+
 static void TestSession()
 {
 	using namespace KHWebSession;
@@ -743,6 +888,7 @@ int wmain(int argc, wchar_t** argv)
 	TestAlbumPage();
 	TestTrackPage();
 	TestHelpers();
+	TestShareLinks();
 	TestSession();
 	TestLayout();
 	TestHistory(dir);

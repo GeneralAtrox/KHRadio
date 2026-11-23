@@ -168,6 +168,8 @@ namespace
 	struct KHRadioAlbumMsg {
 		UINT gen = 0;
 		bool bAppend = false;
+		bool shared = false;      // a pasted share link asked for this album
+		CStringW startAt;         // ... starting at this track (KHShare track key), if any
 		KHInsider::Album album;   // only the tracks that passed the filters
 		CStringW coverPath;       // the cached cover, if it is already on disk
 		int skipped = 0;          // tracks dropped as short or spoken
@@ -301,6 +303,8 @@ struct CKHRadioDlg::FetchParams {
 	bool bAvoidPlayed = false;
 	bool bFilterSpoken = false;
 	bool bExclusive = false;            // only keep albums exclusive to the selected console(s)
+	bool shared = false;                // a pasted share link
+	CStringW startAt;                   // its track (KHShare track key): never filtered out
 	std::vector<CStringW> selectedPlatformNames; // display names of the chosen consoles
 	std::vector<CStringW> playedAlbums; // snapshot of history URLs
 	CStringW coverDir;
@@ -311,6 +315,7 @@ struct CKHRadioDlg::ResolveParams {
 		UINT64 id = 0;
 		CStringW pageUrl;
 		CStringW name;
+		bool keep = false;   // the shared track: the spoken filter leaves it alone
 	};
 	HWND hWnd = nullptr;
 	UINT gen = 0;
@@ -391,6 +396,7 @@ BEGIN_MESSAGE_MAP(CKHRadioDlg, CDialog)
 	ON_BN_CLICKED(IDC_KHRADIO_LOGIN_BUTTON, OnLogin)
 	ON_MESSAGE(KHWebSession::WM_STATUS, OnSessionStatus)
 	ON_LBN_DBLCLK(IDC_KHRADIO_HISTORY_LIST, OnHistoryDblClk)
+	ON_WM_CONTEXTMENU()
 	ON_MESSAGE(WM_KHRADIO_STATUS, OnKHRadioStatus)
 	ON_MESSAGE(WM_KHRADIO_ALBUM, OnKHRadioAlbum)
 	ON_MESSAGE(WM_KHRADIO_RESOLVED, OnKHRadioResolved)
@@ -1105,7 +1111,76 @@ void CKHRadioDlg::OnHistoryDblClk()
 	StartFetch(true, m_history.Albums()[static_cast<size_t>(sel)].url);
 }
 
-void CKHRadioDlg::StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppend)
+void CKHRadioDlg::OnContextMenu(CWnd* pWnd, CPoint pt)
+{
+	if (pWnd != &m_listHistory) {
+		__super::OnContextMenu(pWnd, pt);
+		return;
+	}
+	int index = m_listHistory.GetCurSel();
+	if (pt.x == -1 && pt.y == -1) {
+		CRect r;
+		if (index < 0 || m_listHistory.GetItemRect(index, r) == LB_ERR) {
+			return;
+		}
+		pt = CPoint(r.left + r.Height(), r.bottom);
+		m_listHistory.ClientToScreen(&pt);
+	} else {
+		CPoint client(pt);
+		m_listHistory.ScreenToClient(&client);
+		BOOL outside = TRUE;
+		index = static_cast<int>(m_listHistory.ItemFromPoint(client, outside));
+		if (outside) {
+			return;
+		}
+		m_listHistory.SetCurSel(index);
+	}
+	if (index < 0 || index >= static_cast<int>(m_history.Albums().size())) {
+		return;
+	}
+	const auto album = m_history.Albums()[static_cast<size_t>(index)];
+	const CStringW text = KHShare::AlbumShareText(album.title, album.url);
+	CMenu menu;
+	menu.CreatePopupMenu();
+	menu.AppendMenuW(MF_STRING | (text.IsEmpty() ? MF_GRAYED : 0), 1, L"Share this album");
+	if (menu.TrackPopupMenu(TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, this) == 1) {
+		SetStatus(KHShare::CopyToClipboard(m_hWnd, text) ? L"Album link copied \x2014 paste it to a friend"
+			: L"Could not copy the link: another program is using the clipboard. Try again.");
+	}
+}
+
+void CKHRadioDlg::PlaySharedLink(const KHShare::Link& link)
+{
+	if (link.kind == KHShare::LinkKind::None || link.albumUrl.IsEmpty()) {
+		return;
+	}
+	KHLog::Format(L"share: playing a pasted %s link to %s", link.kind == KHShare::LinkKind::Track ? L"track" : L"album", link.albumUrl.GetString());
+	m_shareNotice.Empty();
+	StartFetch(true, link.albumUrl, false, true, link.kind == KHShare::LinkKind::Track ? link.trackKey : CStringW());
+}
+
+void CKHRadioDlg::CancelSharedLink()
+{
+	bool cancelled = false;
+	if (m_bFetching && m_fetchShared) {
+		(*m_pGen)++; // its result is dropped on arrival
+		m_bFetching = false;
+		cancelled = true;
+	}
+	if (m_pendingStart && m_pendingShared) {
+		m_pendingStart = false;
+		m_fetchRetryAt = 0;
+		cancelled = true;
+	}
+	m_fetchShared = m_pendingShared = false;
+	if (cancelled) {
+		KHLog::Line(L"share: the pasted link was dropped - the user picked something else");
+		SetStatus(L"Stopped loading the shared link.");
+		MaybePrefetchNext();
+	}
+}
+
+void CKHRadioDlg::StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppend, bool shared, const CStringW& startAt)
 {
 	if (KHInsider::IsShuttingDown()) {
 		return;
@@ -1117,14 +1192,20 @@ void CKHRadioDlg::StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppen
 		m_pendingDirect = bDirect;
 		m_pendingAppend = bAppend;
 		m_pendingUrl = albumUrl;
+		m_pendingShared = shared;
+		m_pendingStartAt = startAt;
 		m_fetchRetryAt = 0;
 		if (!bAppend) {
-			SetStatus(SessionStatusText(static_cast<int>(session), 0) + L"\r\nThe album loads as soon as KHInsider answers.");
+			SetStatus(SessionStatusText(static_cast<int>(session), 0)
+				+ (shared ? L"\r\nThe shared link plays as soon as KHInsider answers." : L"\r\nThe album loads as soon as KHInsider answers."));
 		}
 		return;
 	}
 	m_pendingStart = false;
 	m_fetchRetryAt = 0;
+	if (!bAppend && !shared) {
+		m_shareNotice.Empty(); // the user moved on from a shared album
+	}
 
 	auto p = std::make_unique<FetchParams>();
 	p->hWnd = m_hWnd;
@@ -1133,6 +1214,8 @@ void CKHRadioDlg::StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppen
 	p->bDirect = bDirect;
 	p->bAppend = bAppend;
 	p->albumUrl = albumUrl;
+	p->shared = shared;
+	p->startAt = startAt;
 	p->bAvoidPlayed = (m_checkAvoidPlayed.GetCheck() == BST_CHECKED);
 	p->bFilterSpoken = (m_checkFilterSpoken.GetCheck() == BST_CHECKED);
 	p->bExclusive = (m_checkExclusive.GetCheck() == BST_CHECKED);
@@ -1168,9 +1251,13 @@ void CKHRadioDlg::StartFetch(bool bDirect, const CStringW& albumUrl, bool bAppen
 	m_fetchDirect = bDirect;
 	m_fetchAppend = bAppend;
 	m_fetchUrl = albumUrl;
+	m_fetchShared = shared;
+	m_fetchStartAt = startAt;
 	m_bFetching = true;
 	m_fetchStarted = GetTickCount64();
-	SetStatus(bAppend ? L"Queuing the next album..." : (bDirect ? L"Loading album..." : L"Rolling a random album..."));
+	SetStatus(bAppend ? L"Queuing the next album..."
+		: shared ? (startAt.IsEmpty() ? L"Loading the shared album..." : L"Loading the shared track...")
+		: (bDirect ? L"Loading album..." : L"Rolling a random album..."));
 
 	if (!StartWorker(L"fetch", [params = std::move(p)]() mutable { FetchThread(std::move(params)); })) {
 		m_bFetching = false;
@@ -1184,6 +1271,8 @@ unsigned CKHRadioDlg::ScheduleFetchRetry(KHInsider::FetchStatus why)
 	m_pendingDirect = m_fetchDirect;
 	m_pendingAppend = m_fetchAppend;
 	m_pendingUrl = m_fetchUrl;
+	m_pendingShared = m_fetchShared;
+	m_pendingStartAt = m_fetchStartAt;
 	if (why == KHInsider::FetchStatus::LoginRequired || why == KHInsider::FetchStatus::BrowserUnavailable) {
 		m_fetchRetryAt = 0; // runs when the session reports Ready again
 		KHLog::Line(L"radio: fetch waits for the KHInsider session to recover");
@@ -1205,7 +1294,7 @@ void CKHRadioDlg::RunPendingFetch()
 	if (m_pendingAppend) {
 		MaybePrefetchNext(); // only if the radio still needs another album
 	} else {
-		StartFetch(m_pendingDirect, m_pendingUrl, false);
+		StartFetch(m_pendingDirect, m_pendingUrl, false, m_pendingShared, m_pendingStartAt);
 	}
 }
 
@@ -1344,6 +1433,9 @@ void CKHRadioDlg::FetchThread(std::unique_ptr<FetchParams> p)
 		if (p->bFilterSpoken) {
 			auto& tracks = album.tracks;
 			tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [&](const KHInsider::Track& t) {
+				if (!p->startAt.IsEmpty() && KHShare::TrackKeyOf(t.pageUrl) == p->startAt) {
+					return false; // the track someone shared plays whatever the filter says
+				}
 				const bool drop = (t.durationSec > 0 && t.durationSec < KHRADIO_MIN_TRACK_SEC) || KHInsider::IsSpokenTitle(t.name);
 				if (drop) {
 					KHLog::Format(L"skip short/spoken track '%s'", t.name.GetString());
@@ -1406,6 +1498,8 @@ void CKHRadioDlg::FetchThread(std::unique_ptr<FetchParams> p)
 		auto am = std::make_unique<KHRadioAlbumMsg>();
 		am->gen = p->gen;
 		am->bAppend = p->bAppend;
+		am->shared = p->shared;
+		am->startAt = p->startAt;
 		am->album = chosen;
 		am->coverPath = FileHasData(coverPath) ? coverPath : CStringW();
 		am->skipped = skipped;
@@ -1440,7 +1534,7 @@ void CKHRadioDlg::KickResolver()
 			&& p->items.size() < KHRADIO_RESOLVE_BATCH; i++) {
 		const QueueItem& item = queue[static_cast<size_t>(i)];
 		if (!item.IsResolved() && !item.pageUrl.IsEmpty()) {
-			p->items.push_back({ item.id, item.pageUrl, item.ref.name });
+			p->items.push_back({ item.id, item.pageUrl, item.ref.name, item.shared });
 		}
 	}
 	if (p->items.empty()) {
@@ -1478,7 +1572,7 @@ void CKHRadioDlg::ResolveThread(std::unique_ptr<ResolveParams> p)
 		KHInsider::FetchStatus status = KHInsider::FetchStatus::NetworkError;
 		const CStringW url = KHInsider::ResolveTrackAudioUrl(item.pageUrl, &status);
 		if (!url.IsEmpty()) {
-			if (p->bFilterSpoken && KHInsider::ClassifyTrackAudio(url, item.name) != KHInsider::AudioVerdict::Music) {
+			if (p->bFilterSpoken && !item.keep && KHInsider::ClassifyTrackAudio(url, item.name) != KHInsider::AudioVerdict::Music) {
 				msg->outcome = ResolveOutcome::Filtered;
 			} else {
 				msg->outcome = ResolveOutcome::Resolved;
@@ -1640,7 +1734,7 @@ void CKHRadioDlg::KickPreparer()
 	p->name = item.ref.name;
 	p->mode = item.prepare;
 	p->current = target == cur;
-	p->bFilterSpoken = (m_checkFilterSpoken.GetCheck() == BST_CHECKED);
+	p->bFilterSpoken = (m_checkFilterSpoken.GetCheck() == BST_CHECKED) && !item.shared;
 	m_bPreparing = true;
 	m_prepareId = item.id;
 	m_prepareStarted = GetTickCount64();
@@ -1847,15 +1941,27 @@ LRESULT CKHRadioDlg::OnKHRadioAlbum(WPARAM, LPARAM lParam)
 		player.Clear(); // the user rolled a new album: switch now
 	}
 	const bool ranDry = !player.IsActive();
+	// a shared track link starts at that track; the rest of the album follows
+	int startTrack = 0;
+	if (!m->bAppend && m->shared && !m->startAt.IsEmpty()) {
+		startTrack = KHShare::FindTrack(album.tracks, m->startAt);
+		if (startTrack < 0) {
+			KHLog::Format(L"share: the shared track '%s' is not on %s - playing the album from the start", m->startAt.GetString(), album.url.GetString());
+			m_shareNotice = L"The shared track is not on the album page any more, so the album plays from the start.";
+			startTrack = 0;
+		}
+	}
 	int first = -1;
-	for (const auto& track : album.tracks) {
+	for (size_t t = 0; t < album.tracks.size(); t++) {
+		const auto& track = album.tracks[t];
 		QueueItem item;
 		item.id = NewQueueItemId();
 		item.pageUrl = track.pageUrl;
 		item.label.Format(L"%02d. %s", track.number, track.name.GetString());
 		item.ref = { track.name, album.url, album.title, m->coverPath, album.platforms };
+		item.shared = m->shared && !m->startAt.IsEmpty() && m_shareNotice.IsEmpty() && static_cast<int>(t) == startTrack;
 		const int at = player.Append(item);
-		if (first < 0) {
+		if (static_cast<int>(t) == startTrack) {
 			first = at;
 		}
 	}
@@ -1898,6 +2004,9 @@ LRESULT CKHRadioDlg::OnKHRadioDone(WPARAM, LPARAM lParam)
 		status.Format(m->bAppend ? L"Queued next: %s" : L"Playing: %s", m->title.GetString());
 		if (m->skipped > 0) {
 			status.AppendFormat(L"  (skipped %d short or spoken)", m->skipped);
+		}
+		if (!m->bAppend && !m_shareNotice.IsEmpty()) {
+			status += L"\r\n" + m_shareNotice;
 		}
 		SetStatus(status);
 		MaybePrefetchNext(); // top the queue up if still short
@@ -1961,7 +2070,10 @@ void CKHRadioDlg::OnPlaybackStarted(const QueueItem& item, bool resumed)
 
 	CStringW status;
 	status.Format(L"Now playing: %s - %s", track.albumTitle.GetString(), track.name.GetString());
-	if (!track.platforms.IsEmpty()) {
+	if (!m_shareNotice.IsEmpty()) {
+		status += L"\r\n" + m_shareNotice; // once, with the first track of the shared album
+		m_shareNotice.Empty();
+	} else if (!track.platforms.IsEmpty()) {
 		status.AppendFormat(L"\r\nPlatforms: %s", track.platforms.GetString());
 	}
 	SetStatus(status);

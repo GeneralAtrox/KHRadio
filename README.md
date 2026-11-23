@@ -5,10 +5,10 @@ A small standalone Windows app that plays continuous video-game-music radio from
 "Random Album Advanced" filters (type, year, platform), keeps the next album queued
 ahead, shows the album cover, and remembers what you have heard.
 
-Version 1.2.0. It was extracted from the KH Radio panel of the MPC-BE fork in this
-repository and shares nothing with MPC-BE: its own exe, window class, settings, data
-folders and browser profile. It registers no file types, shell extensions or autoplay
-handlers and ignores command-line arguments.
+Version 1.3.0. It started as the KH Radio panel of an MPC-BE fork and now lives in its
+own repository. It shares nothing with MPC-BE: its own exe, window class, settings,
+data folders and browser profile. It registers no file types, URL schemes, shell
+extensions or autoplay handlers and ignores command-line arguments.
 
 ## Using it
 
@@ -22,8 +22,37 @@ handlers and ignores command-line arguments.
   screen) with the track, album and cover, so media keys and headset buttons work
   from any app. The keyboard's media keys also work while KH Radio has focus.
 - Double-click an album in **History** to play it again.
+- **Share a song**: the up-arrow button next to the transport copies the playing track
+  to the clipboard, ready to paste into any chat. Right-click a queue row for "Share
+  this track" or "Share this album", or a history row for "Share this album".
+- **Play a shared song**: copy the message someone sent you, then press the down-arrow
+  button (or Ctrl+V anywhere in KH Radio). See [Sharing](#sharing).
 - Track audio is looked up a few tracks ahead of the one playing, so a new album
   starts after one page load instead of one per track.
+
+## Sharing
+
+What is copied is plain text: the track and album on the first line and the track's
+own KHInsider page on the second, for example
+
+```
+Konami Morning Music (Bubble System Startup Theme) — The Konamic Game Freaks
+https://downloads.khinsider.com/game-soundtracks/album/<album>/<track>
+```
+
+The link opens in a browser too, so it works for someone without KH Radio. Nothing
+else is shared: no audio file addresses and nothing about your account.
+
+When you play a shared link, KH Radio looks for the first KHInsider album or track link
+anywhere in the clipboard text (surrounding words, `<brackets>`, trailing punctuation,
+markdown links, `http`/`www.`, query strings and percent-encoding are all fine). Only
+`downloads.khinsider.com/game-soundtracks/album/...` links are accepted; anything else
+is refused before any request is made, and the status line says "No KH Radio link on
+the clipboard". A track link loads its album and starts at that track (if the track is
+no longer on the album page, the album plays from the start and the status line says
+so); an album link plays like a history replay. Either way the radio carries on
+afterwards. If you are not signed in, the link waits and plays once you are. Rolling
+an album, double-clicking history or the queue, or skipping drops a link still loading.
 
 ## When something goes wrong
 
@@ -124,7 +153,8 @@ manifest identity and the log line all read it.
 ## Tests
 
 `tests\KHRadioTests` is a console program. By default it runs offline: the album
-and track page parser on small hand-written pages in `tests\fixtures`, response
+and track page parser on small hand-written pages in `tests\fixtures`, share links
+(building them, finding them in messy pasted text, refusing lookalike hosts), response
 classification, retry delays, the panel layout at 100/150/200% DPI, history files
 (round trip, damaged file, damaged backup, empty list) and the browser session's
 shutdown. `--live` also checks the saved sign-in against the real site, and

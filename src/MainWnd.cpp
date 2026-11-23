@@ -5,6 +5,7 @@
 #include "MainWnd.h"
 #include "AppData.h"
 #include "Log.h"
+#include "ShareLink.h"
 
 #include <dwmapi.h>
 #include <set>
@@ -25,6 +26,8 @@ namespace
 	constexpr wchar_t kGlyphVolume = 0xE767;
 	constexpr wchar_t kGlyphMute = 0xE74F;
 	constexpr wchar_t kGlyphMusic = 0xE8D6;
+	constexpr wchar_t kGlyphShare = 0xE898;      // Upload: an arrow rising out of a tray
+	constexpr wchar_t kGlyphPlayShared = 0xE896; // Download: an arrow dropping into it
 
 	// One key press can arrive both through the media controls and as
 	// WM_APPCOMMAND; the second copy within this time is ignored.
@@ -99,6 +102,9 @@ BEGIN_MESSAGE_MAP(CMainWnd, CWnd)
 	ON_BN_CLICKED(IDC_KHRADIO_PLAYPAUSE, OnPlayPause)
 	ON_BN_CLICKED(IDC_KHRADIO_NEXT, OnNext)
 	ON_LBN_DBLCLK(IDC_KHRADIO_QUEUE, OnQueueDblClk)
+	ON_BN_CLICKED(IDC_KHRADIO_SHARE, OnShare)
+	ON_BN_CLICKED(IDC_KHRADIO_PLAYSHARED, OnPlayShared)
+	ON_WM_CONTEXTMENU()
 	ON_MESSAGE(WM_KHRADIO_PLAYER_EVENT, OnPlayerEvent)
 	ON_MESSAGE(WM_KHRADIO_SLIDER, OnSlider)
 	ON_MESSAGE(WM_DPICHANGED, OnDpiChanged)
@@ -161,9 +167,13 @@ int CMainWnd::OnCreate(LPCREATESTRUCT cs)
 	m_seek.Create(this, IDC_KHRADIO_SEEK);
 	m_volume.Create(this, IDC_KHRADIO_VOLUME);
 	m_volume.SetValue(m_player.Volume());
-	m_prev.Create(this, IDC_KHRADIO_PREV, kGlyphPrev, false);
-	m_play.Create(this, IDC_KHRADIO_PLAYPAUSE, kGlyphPlay, true);
-	m_next.Create(this, IDC_KHRADIO_NEXT, kGlyphNext, false);
+	m_share.Create(this, IDC_KHRADIO_SHARE, kGlyphShare, false, L"Share this song");
+	m_playShared.Create(this, IDC_KHRADIO_PLAYSHARED, kGlyphPlayShared, false, L"Play a shared link");
+	m_prev.Create(this, IDC_KHRADIO_PREV, kGlyphPrev, false, L"Previous track");
+	m_play.Create(this, IDC_KHRADIO_PLAYPAUSE, kGlyphPlay, true, L"Play or pause");
+	m_next.Create(this, IDC_KHRADIO_NEXT, kGlyphNext, false, L"Next track");
+	m_share.SetGlyphFont(&m_fontGlyph);
+	m_playShared.SetGlyphFont(&m_fontGlyph);
 	m_prev.SetGlyphFont(&m_fontGlyph);
 	m_play.SetGlyphFont(&m_fontGlyphBig);
 	m_next.SetGlyphFont(&m_fontGlyph);
@@ -171,6 +181,19 @@ int CMainWnd::OnCreate(LPCREATESTRUCT cs)
 		WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
 		CRect(0, 0, 10, 10), this, IDC_KHRADIO_QUEUE);
 	m_queue.SetFont(&m_fontUI);
+	if (m_tips.Create(this, TTS_ALWAYSTIP | TTS_NOPREFIX)) {
+		const auto addTip = [&](CWnd& button, LPCWSTR text) {
+			TOOLINFOW ti = { sizeof(ti) };
+			ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+			ti.hwnd = m_hWnd;
+			ti.uId = reinterpret_cast<UINT_PTR>(button.m_hWnd);
+			ti.lpszText = const_cast<LPWSTR>(text);
+			m_tips.SendMessageW(TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+		};
+		addTip(m_share, L"Share this song (copies a link)");
+		addTip(m_playShared, L"Play a shared link from the clipboard (Ctrl+V)");
+	}
+	UpdateShareButton();
 
 	if (!m_dlg.Create(this, this)) {
 		return -1;
@@ -301,6 +324,8 @@ void CMainWnd::Layout()
 	m_play.MoveWindow(cx - bb / 2, y, bb, bb);
 	m_prev.MoveWindow(cx - bb / 2 - S(12) - b, y + (bb - b) / 2, b, b);
 	m_next.MoveWindow(cx + bb / 2 + S(12), y + (bb - b) / 2, b, b);
+	m_share.MoveWindow(panel.left, y + (bb - b) / 2, b, b);
+	m_playShared.MoveWindow(panel.left + b + S(6), y + (bb - b) / 2, b, b);
 	const int volW = std::min(S(110), std::max(S(40), pw / 2 - bb / 2 - b - S(60)));
 	m_volume.MoveWindow(panel.right - volW, y + (bb - S(20)) / 2, volW, S(20), TRUE);
 	m_rcVolumeIcon = CRect(panel.right - volW - S(26), y + (bb - S(20)) / 2, panel.right - volW - S(4), y + (bb + S(20)) / 2);
@@ -326,7 +351,7 @@ void CMainWnd::OnGetMinMaxInfo(MINMAXINFO* mmi)
 	if (!m_dlg.m_hWnd) {
 		return;
 	}
-	CRect r(0, 0, m_dlg.GetNaturalSize().cx + S(360), std::max(m_dlg.GetMinimumHeight(), S(600)));
+	CRect r(0, 0, m_dlg.GetNaturalSize().cx + S(380), std::max(m_dlg.GetMinimumHeight(), S(600)));
 	AdjustWindowRectExForDpi(&r, GetStyle(), FALSE, GetExStyle(), m_dpi);
 	mmi->ptMinTrackSize.x = r.Width();
 	mmi->ptMinTrackSize.y = r.Height();
@@ -543,6 +568,7 @@ LRESULT CMainWnd::OnSlider(WPARAM wParam, LPARAM lParam)
 
 void CMainWnd::OnPrev()
 {
+	m_dlg.CancelSharedLink();
 	m_player.Prev();
 }
 
@@ -557,6 +583,7 @@ void CMainWnd::OnPlayPause()
 
 void CMainWnd::OnNext()
 {
+	m_dlg.CancelSharedLink();
 	m_player.Next();
 }
 
@@ -564,8 +591,111 @@ void CMainWnd::OnQueueDblClk()
 {
 	const int sel = m_queue.GetCurSel();
 	if (sel != LB_ERR) {
+		m_dlg.CancelSharedLink();
 		m_player.PlayIndex(sel);
 	}
+}
+
+void CMainWnd::ShareText(const CStringW& text, LPCWSTR what)
+{
+	if (text.IsEmpty()) {
+		m_dlg.SetStatus(CStringW(L"This ") + what + L" has no KHInsider page to share.");
+	} else if (KHShare::CopyToClipboard(m_hWnd, text)) {
+		m_dlg.SetStatus(wcscmp(what, L"album") == 0 ? L"Album link copied \x2014 paste it to a friend" : L"Link copied \x2014 paste it to a friend");
+	} else {
+		m_dlg.SetStatus(L"Could not copy the link: another program is using the clipboard. Try again.");
+	}
+}
+
+void CMainWnd::OnShare()
+{
+	if (const QueueItem* cur = m_player.Current()) {
+		ShareText(KHShare::TrackShareText(cur->ref.name, cur->ref.albumTitle, KHShare::TrackPageFor(cur->pageUrl, cur->ref.albumUrl, cur->audioUrl)), L"track");
+	}
+}
+
+void CMainWnd::OnPlayShared()
+{
+	KHShare::Link link;
+	if (!KHShare::FindLink(KHShare::ReadClipboard(m_hWnd), link)) {
+		m_dlg.SetStatus(L"No KH Radio link on the clipboard");
+		return;
+	}
+	m_dlg.PlaySharedLink(link);
+}
+
+void CMainWnd::OnContextMenu(CWnd* wnd, CPoint pt)
+{
+	if (wnd != &m_queue) {
+		CWnd::OnContextMenu(wnd, pt);
+		return;
+	}
+	int index = m_queue.GetCurSel();
+	if (pt.x == -1 && pt.y == -1) {
+		// keyboard (Shift+F10, menu key): the selected row
+		CRect r;
+		if (index < 0 || m_queue.GetItemRect(index, r) == LB_ERR) {
+			return;
+		}
+		pt = CPoint(r.left + S(16), r.bottom);
+		m_queue.ClientToScreen(&pt);
+	} else {
+		CPoint client(pt);
+		m_queue.ScreenToClient(&client);
+		BOOL outside = TRUE;
+		index = static_cast<int>(m_queue.ItemFromPoint(client, outside));
+		if (outside) {
+			return;
+		}
+		m_queue.SetCurSel(index);
+	}
+	const QueueItem* item = m_player.Item(index);
+	if (!item) {
+		return;
+	}
+	const QueueItem copy = *item;
+	CMenu menu;
+	menu.CreatePopupMenu();
+	menu.AppendMenuW(MF_STRING | (KHShare::TrackPageFor(copy.pageUrl, copy.ref.albumUrl, copy.audioUrl).IsEmpty() ? MF_GRAYED : 0), 1, L"Share this track");
+	menu.AppendMenuW(MF_STRING, 2, L"Share this album");
+	switch (menu.TrackPopupMenu(TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, this)) {
+		case 1: ShareText(KHShare::TrackShareText(copy.ref.name, copy.ref.albumTitle, KHShare::TrackPageFor(copy.pageUrl, copy.ref.albumUrl, copy.audioUrl)), L"track"); break;
+		case 2: ShareText(KHShare::AlbumShareText(copy.ref.albumTitle, copy.ref.albumUrl), L"album"); break;
+		default: break;
+	}
+}
+
+void CMainWnd::UpdateShareButton()
+{
+	if (m_share.m_hWnd) {
+		const QueueItem* cur = m_player.Current();
+		m_share.EnableWindow(cur && !KHShare::TrackPageFor(cur->pageUrl, cur->ref.albumUrl, cur->audioUrl).IsEmpty());
+	}
+}
+
+bool CMainWnd::TranslateShortcut(MSG* msg)
+{
+	if (!m_hWnd || (msg->message != WM_KEYDOWN && msg->message != WM_CHAR)
+			|| (msg->hwnd != m_hWnd && !::IsChild(m_hWnd, msg->hwnd))) {
+		return false;
+	}
+	const bool ctrl = GetKeyState(VK_CONTROL) < 0, alt = GetKeyState(VK_MENU) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+	if (msg->message == WM_KEYDOWN && msg->wParam == 'V' && ctrl && !alt && !shift) {
+		wchar_t cls[32] = {};
+		::GetClassNameW(msg->hwnd, cls, 32);
+		const bool textField = _wcsicmp(cls, L"Edit") == 0 || _wcsnicmp(cls, L"RichEdit", 8) == 0
+			|| (::SendMessageW(msg->hwnd, WM_GETDLGCODE, 0, 0) & DLGC_HASSETSEL) != 0;
+		if (textField) {
+			return false; // a text field pastes as usual
+		}
+		OnPlayShared();
+		return true;
+	}
+	if (msg->wParam == VK_TAB && !ctrl && !alt) {
+		// one tab order for the whole window: filters, history, then the player
+		return ::IsDialogMessageW(m_hWnd, msg) != FALSE;
+	}
+	return false;
 }
 
 void CMainWnd::MediaCommand(MediaCmd cmd, bool fromMediaControls)
@@ -631,6 +761,7 @@ void CMainWnd::OnTrackStarted(int index, bool resumed)
 	UpdateTitle();
 	UpdateMediaTrack();
 	RefreshQueueList();
+	UpdateShareButton();
 	Invalidate(FALSE);
 	KHRadioData::SaveQueue(m_player.Queue(), m_player.CurrentIndex(), resumed ? m_player.Position() : 0.0);
 }
@@ -672,6 +803,7 @@ void CMainWnd::OnPlayerError(int index, const CStringW& message)
 void CMainWnd::OnQueueChanged()
 {
 	RefreshQueueList();
+	UpdateShareButton();
 	Invalidate(FALSE);
 }
 
@@ -679,6 +811,7 @@ void CMainWnd::OnStateChanged()
 {
 	const auto state = m_player.GetState();
 	m_play.SetGlyph(state == CRadioPlayer::State::Playing || state == CRadioPlayer::State::Loading ? kGlyphPause : kGlyphPlay);
+	UpdateShareButton();
 	switch (state) {
 		case CRadioPlayer::State::Playing: m_media.SetStatus(CMediaSession::Status::Playing); break;
 		case CRadioPlayer::State::Loading: m_media.SetStatus(CMediaSession::Status::Changing); break;

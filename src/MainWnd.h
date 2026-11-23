@@ -14,6 +14,9 @@ class CMainWnd : public CWnd, public IPlayerListener, public IKHRadioHost
 public:
 	CMainWnd() = default;
 	BOOL CreateMain();
+	// Ctrl+V (play a shared link) and Tab across the whole window; called by the
+	// app before the message is dispatched. True if the message was used.
+	bool TranslateShortcut(MSG* msg);
 
 	// IKHRadioHost
 	CRadioPlayer& Player() override { return m_player; }
@@ -48,6 +51,9 @@ protected:
 	afx_msg void OnPlayPause();
 	afx_msg void OnNext();
 	afx_msg void OnQueueDblClk();
+	afx_msg void OnShare();
+	afx_msg void OnPlayShared();
+	afx_msg void OnContextMenu(CWnd* wnd, CPoint pt);
 	afx_msg LRESULT OnPlayerEvent(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnSlider(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnDpiChanged(WPARAM wParam, LPARAM lParam);
@@ -70,12 +76,16 @@ private:
 	void PruneCovers(bool startup);
 	void MediaCommand(MediaCmd cmd, bool fromMediaControls);
 	void SaveState();
+	void UpdateShareButton();
+	void ShareText(const CStringW& text, LPCWSTR what);
 
 	CRadioPlayer m_player;
 	CKHRadioDlg m_dlg;
 	CSliderBar m_seek;
 	CSliderBar m_volume;
 	CGlyphButton m_prev, m_play, m_next;
+	CGlyphButton m_share, m_playShared;
+	CToolTipCtrl m_tips;
 	CListBox m_queue;
 	CMediaSession m_media;
 
