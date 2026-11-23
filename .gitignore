@@ -2,3 +2,4 @@ _build/
 bin/
 .vs/
 *.user
+.work/
