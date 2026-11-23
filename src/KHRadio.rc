@@ -1,0 +1,65 @@
+// KH Radio resources. GPL-3.0-or-later (see COPYING.txt).
+#include "resource.h"
+#include "afxres.h"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+IDR_MAINFRAME           ICON                    "..\\res\\KHRadio.ico"
+
+// Copied from the MPC-BE fork's mplayerc.rc (IDD_KHRADIO_DLG), unchanged
+// apart from DS_CONTROL so it tabs as part of the main window.
+IDD_KHRADIO_DLG DIALOGEX 0, 0, 170, 484
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    PUSHBUTTON      "Sign in to KHInsider...",IDC_KHRADIO_LOGIN_BUTTON,5,4,160,16
+    LTEXT           "Album Type (Ctrl-click to select/deselect)",IDC_KHRADIO_TYPE_LABEL,5,28,160,8
+    LISTBOX         IDC_KHRADIO_TYPE_LIST,5,38,160,50,LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Year",IDC_KHRADIO_YEAR_LABEL,5,92,160,8
+    LISTBOX         IDC_KHRADIO_YEAR_LIST,5,102,160,50,LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Platform",IDC_KHRADIO_PLATFORM_LABEL,5,156,160,8
+    LISTBOX         IDC_KHRADIO_PLATFORM_LIST,5,166,160,62,LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Clear Filters",IDC_KHRADIO_CLEAR_BUTTON,5,232,160,12
+    CONTROL         "Skip albums I've already heard",IDC_KHRADIO_AVOID_CHECK,
+                    "Button",BS_AUTOCHECKBOX | WS_TABSTOP,5,248,160,10
+    CONTROL         "Filter spoken / short / silent tracks",IDC_KHRADIO_SPOKEN_CHECK,
+                    "Button",BS_AUTOCHECKBOX | WS_TABSTOP,5,260,160,10
+    CONTROL         "Only console-exclusive games",IDC_KHRADIO_EXCLUSIVE_CHECK,
+                    "Button",BS_AUTOCHECKBOX | WS_TABSTOP,5,272,160,10
+    DEFPUSHBUTTON   "Show Me A Random Album",IDC_KHRADIO_RANDOM_BUTTON,5,286,160,16
+    LTEXT           "",IDC_KHRADIO_STATUS,5,304,160,30
+    LTEXT           "History (double-click to replay)",IDC_KHRADIO_HISTORY_LABEL,5,338,160,8
+    LISTBOX         IDC_KHRADIO_HISTORY_LIST,5,348,160,131,LBS_NOINTEGRALHEIGHT | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "KH Radio - video game music radio for KHInsider"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "KHRadio"
+            VALUE "LegalCopyright", "GPL-3.0-or-later"
+            VALUE "OriginalFilename", "KHRadio.exe"
+            VALUE "ProductName", "KH Radio"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+#ifndef _AFXDLL
+#include "afxres.rc"
+#endif

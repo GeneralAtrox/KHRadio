@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6F4C2B7E-3D2A-4E8B-9C61-5A0D7E1B4C2F}</ProjectGuid>
+    <Keyword>MFCProj</Keyword>
+    <RootNamespace>KHRadio</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseOfMfc>Static</UseOfMfc>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="thirdparty\webview2\WebView2.props" />
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)_build\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)_build\obj\$(Configuration)\</IntDir>
+    <TargetName>KHRadio</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>false</ConformanceMode>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(MSBuildThisFileDirectory)thirdparty;$(MSBuildThisFileDirectory)thirdparty\rapidjson\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;RAPIDJSON_SSE2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ResourceCompile>
+      <Culture>0x0409</Culture>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>mfplat.lib;mfuuid.lib;windowscodecs.lib;dwmapi.lib;uxtheme.lib;msimg32.lib;winhttp.lib;shlwapi.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <Manifest>
+      <EnableDpiAwareness>false</EnableDpiAwareness>
+      <AdditionalManifestFiles>$(MSBuildThisFileDirectory)src\KHRadio.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
+    </Manifest>
+    <PostBuildEvent>
+      <Message>Copy the optional curl-impersonate runtime next to the exe</Message>
+      <Command>copy /y "$(MSBuildThisFileDirectory)thirdparty\curl-impersonate\*.dll" "$(OutDir)" &gt;nul</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+    </ClCompile>
+    <Link><GenerateDebugInformation>true</GenerateDebugInformation></Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\App.cpp" />
+    <ClCompile Include="src\AppData.cpp" />
+    <ClCompile Include="src\KHInsider.cpp" />
+    <ClCompile Include="src\KHRadioDlg.cpp" />
+    <ClCompile Include="src\KHWebSession.cpp" />
+    <ClCompile Include="src\MainWnd.cpp" />
+    <ClCompile Include="src\Player.cpp" />
+    <ClCompile Include="src\UiKit.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\AppData.h" />
+    <ClInclude Include="src\JsonHelper.h" />
+    <ClInclude Include="src\KHInsider.h" />
+    <ClInclude Include="src\KHRadioDlg.h" />
+    <ClInclude Include="src\KHRadioLayout.h" />
+    <ClInclude Include="src\KHWebSession.h" />
+    <ClInclude Include="src\MainWnd.h" />
+    <ClInclude Include="src\Player.h" />
+    <ClInclude Include="src\RadioTypes.h" />
+    <ClInclude Include="src\resource.h" />
+    <ClInclude Include="src\stdafx.h" />
+    <ClInclude Include="src\TextUtil.h" />
+    <ClInclude Include="src\UiKit.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\KHRadio.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\KHRadio.manifest" />
+    <Image Include="res\KHRadio.ico" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
