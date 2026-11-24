@@ -30,9 +30,16 @@ $sdk = Join-Path $root "_build\WebView2\$sdkVersion"
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'thirdparty\webview2\restore.ps1') -Destination $sdk
 if ($LASTEXITCODE -ne 0) { 'FAIL: WebView2 SDK restore failed'; exit 2 }
 
+# v143's default toolset can be an older one without MFC; use the newest installed toolset that has it.
+$vsRoot = (& $vswhere -latest -products * -property installationPath | Select-Object -First 1)
+$toolset = Get-ChildItem (Join-Path $vsRoot 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path (Join-Path $_.FullName 'atlmfc\lib\x64\mfcs140.lib') } |
+    Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+$toolsetArg = if ($toolset) { @("/p:VCToolsVersion=$($toolset.Name)") } else { @() }
+
 function Invoke-Build([string]$project, [string]$name) {
     $log = Join-Path $logs "$name-$Configuration.log"
-    $buildArgs = @("`"$project`"", '/m', '/nologo', '/v:quiet', "/p:Configuration=$Configuration", '/p:Platform=x64',
+    $buildArgs = @("`"$project`"", '/m', '/nologo', '/v:quiet', "/p:Configuration=$Configuration", '/p:Platform=x64') + $toolsetArg + @(
         "/flp:LogFile=`"$log`";Verbosity=normal")
     $p = Start-Process -FilePath $builder -ArgumentList $buildArgs -NoNewWindow -PassThru `
         -RedirectStandardOutput (Join-Path $logs "$name-$Configuration.out.txt")
