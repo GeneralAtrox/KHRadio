@@ -68,6 +68,16 @@ namespace KHAudio
 	constexpr double kStrongScore = 2.5;     // enough on its own
 	constexpr double kVeryStrongScore = 3.0; // needed in an album that has sounded musical
 
+	// A long track is also sampled along its whole length, because a talk show
+	// that alternates talking with music can have music at both of the first
+	// two windows. Tracks of kSpreadMinBytes or more get kSpreadWindows shorter
+	// windows, one in the middle of each equal slice of the file; the track is
+	// talking when a quarter or more of them score kModerateScore or higher.
+	constexpr size_t kSpreadWindowBytes = 131072;
+	constexpr unsigned long long kSpreadMinBytes = 8ull * 1024 * 1024;
+	constexpr int kSpreadWindows = 16;
+	constexpr int kSpreadMinJudged = 8; // fewer windows than this decide nothing
+
 	struct Decision {
 		KHInsider::AudioVerdict verdict = KHInsider::AudioVerdict::Music;
 		Strength strength = Strength::None; // for Spoken
@@ -75,11 +85,19 @@ namespace KHAudio
 		int windows = 0;       // windows that could be judged
 		Features w[2];
 		bool judged = false;   // false: no audio could be analysed (counts as music)
+		int spreadJudged = 0;  // windows judged along a long track (0: not sampled)
+		int spreadTalking = 0; // ... of which scored kModerateScore or higher
+		bool spreadTalk = false; // talking at a quarter or more of those windows
 	};
 
 	// Combines the windows: talking only when every window says so; silent only
 	// when every window is silent.
 	Decision Decide(const Features* w, int count);
+	// Adds the windows sampled along a long track to a decision. Enough talking
+	// among them makes the track Spoken whatever the first two windows said.
+	void ApplySpread(Decision& d, const Features* w, int count);
+	// Where spread window 'index' (0-based) starts, or 0 when the file is too short.
+	unsigned long long SpreadWindowStart(unsigned long long total, unsigned long long audioStart, int index);
 	Decision ClassifyPcmWindows(const std::vector<float>& first, const std::vector<float>& middle, int hz);
 
 	// Mp3 frames to mono floats (-1..1); 'skipFrames' decoded frames are dropped

@@ -49,6 +49,10 @@ With **Filter spoken / short / silent tracks** ticked, KH Radio passes over them
   between phrases and has no beat. A track counts as talking only when **both**
   windows sound like it, so a spoken intro followed by music is kept, and so are
   chiptune, piano, music box, ambient pieces and medleys.
+- **Long tracks** (8 MB or more) that pass that check are also sampled at 16 points
+  along their length (about 128 KB each). A talk show that alternates talking with
+  music can have music at both of the first two windows; if a quarter or more of
+  the 16 points sound like talking, the track is skipped, in any album.
 - **The album decides how sure it has to be.** In an album that has sounded musical,
   only very clear talking is skipped (one or two odd tracks are kept unless they are
   plainly speech); in an album that is mostly talking, less is needed; a title cue
@@ -70,8 +74,10 @@ included music the 1.3 filter had wrongly skipped; on both halves the new rule
 dropped none of the music, those included. It found about four in five talking tracks overall (most drama-CD and
 radio-show tracks, every drama track titled as one) and about three in five drama or
 cutscene tracks inside otherwise musical soundtracks. What it still misses: talking
-over music or sound effects (cutscenes mixed with score), and short exchanges inside
-an album that has sounded musical, unless the title gives them away. It was tuned to
+over music or sound effects (cutscenes mixed with score), short exchanges inside
+an album that has sounded musical, unless the title gives them away, and tracks under
+8 MB that mix talking with music. The long-track rule was set on one 25-minute radio-show
+track and five other tracks from the same album, not on the labelled sample. It was tuned to
 keep music first, so it errs on the side of playing talking rather than skipping a song.
 
 ## Sharing

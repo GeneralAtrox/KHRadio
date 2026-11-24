@@ -1297,6 +1297,42 @@ static void TestTalkingDetector()
 	both[1].quiet = true; both[1].score = -1.0;
 	CHECK(KHAudio::Decide(both, 2).verdict == AudioVerdict::Music); // a silent window is not talking
 
+	// a long track sampled along its length: talking at a quarter of the points is enough
+	{
+		KHAudio::Features s[KHAudio::kSpreadWindows];
+		for (auto& f : s) { f.valid = true; f.score = -4.0; }
+		KHAudio::Features musicPair[2] = { a, b }; // 3.5 and -0.5: music by the two-window rule
+		auto d = KHAudio::Decide(musicPair, 2);
+		KHAudio::ApplySpread(d, s, KHAudio::kSpreadWindows);
+		CHECK(d.spreadJudged == 16 && d.spreadTalking == 0 && !d.spreadTalk && d.verdict == AudioVerdict::Music);
+		s[1].score = s[5].score = s[9].score = 2.0;
+		KHAudio::ApplySpread(d, s, KHAudio::kSpreadWindows);
+		CHECK(d.spreadTalking == 3 && !d.spreadTalk && d.verdict == AudioVerdict::Music); // 3 of 16: kept
+		s[13].score = 1.0;
+		KHAudio::ApplySpread(d, s, KHAudio::kSpreadWindows);
+		CHECK(d.spreadTalking == 4 && d.spreadTalk && d.verdict == AudioVerdict::Spoken);
+		KHAudio::AlbumTally musicalAlbum;
+		musicalAlbum.judged = 8;
+		CHECK(KHAudio::ApplyAlbumContext(d, KHInsider::TitleCue::None, musicalAlbum).skip == SkipReason::Talking);
+		// a weak score or a silent window is not talking; too few judged windows decide nothing
+		s[13].score = 0.9;
+		auto weakOne = KHAudio::Decide(musicPair, 2);
+		KHAudio::ApplySpread(weakOne, s, KHAudio::kSpreadWindows);
+		CHECK(!weakOne.spreadTalk);
+		s[13].score = 3.0; s[13].quiet = true;
+		KHAudio::ApplySpread(weakOne, s, KHAudio::kSpreadWindows);
+		CHECK(!weakOne.spreadTalk);
+		for (int i = 0; i < 7; i++) { s[i].score = 2.0; }
+		auto few = KHAudio::Decide(musicPair, 2);
+		KHAudio::ApplySpread(few, s, 7);
+		CHECK(few.spreadJudged == 7 && !few.spreadTalk && few.verdict == AudioVerdict::Music);
+		// placement: none under 8 MB, otherwise the middle of each sixteenth
+		CHECK(KHAudio::SpreadWindowStart(8ull * 1024 * 1024 - 1, 0, 0) == 0);
+		CHECK(KHAudio::SpreadWindowStart(16ull * 1024 * 1024 + 1000, 1000, 0) == 1000 + 524288 - 65536);
+		CHECK(KHAudio::SpreadWindowStart(16ull * 1024 * 1024 + 1000, 1000, 15) == 1000 + 15ull * 1048576 + 524288 - 65536);
+		CHECK(KHAudio::SpreadWindowStart(16ull * 1024 * 1024, 0, 16) == 0);
+	}
+
 	// the middle window: placed from the file size, none when the file is short
 	CHECK(KHAudio::MiddleWindowStart(0, 0, KHAudio::kWindowBytes) == 0);
 	CHECK(KHAudio::MiddleWindowStart(400000, 0, KHAudio::kWindowBytes) == 0);
@@ -1481,8 +1517,69 @@ static void TestSkippedQueue(const CStringW& dir)
 	CHECK(KHRadioData::LoadKeepList(dir + L"missing.json").empty());
 }
 
+// ---- scan mode (not run by default) ---------------------------------------
+// KHRadioTests --scan <file.mp3> [window seconds]
+// Decodes a whole mp3 from disk and prints the talking score of every window
+// along its length, the share of windows at each strength, and the verdict the
+// app's own route gives when its ranged reads are served from the file.
+namespace Scan
+{
+	int Run(const wchar_t* path, double windowSec)
+	{
+		std::vector<char> data;
+		if (KHFile::ReadAll(path, data, 256u * 1024 * 1024) != KHFile::ReadResult::Ok || data.size() < 4096) {
+			fputs("FAIL: cannot read the file\n", stderr);
+			return 2;
+		}
+		const auto* u = reinterpret_cast<const unsigned char*>(data.data());
+		const size_t tag = KHInsider::Id3v2TagSize(u, data.size());
+		std::vector<float> mono;
+		int hz = 0;
+		if (tag >= data.size() || !KHAudio::DecodeMp3(u + tag, data.size() - tag, 0, 7200.0, mono, hz)) {
+			fputs("FAIL: cannot decode the file\n", stderr);
+			return 2;
+		}
+		const size_t win = static_cast<size_t>(windowSec * hz);
+		int n = 0, weak = 0, moderate = 0, strong = 0, quiet = 0;
+		for (size_t at = 0; at + win <= mono.size(); at += win) {
+			const KHAudio::Features f = KHAudio::Analyse(mono.data() + at, win, hz);
+			n++;
+			quiet += f.quiet ? 1 : 0;
+			weak += !f.quiet && f.score >= KHAudio::kWeakScore ? 1 : 0;
+			moderate += !f.quiet && f.score >= KHAudio::kModerateScore ? 1 : 0;
+			strong += !f.quiet && f.score >= KHAudio::kStrongScore ? 1 : 0;
+			printf("%5.0f s=%+.2f tonal=%.2f beat=%.2f pause=%.2f gaps=%.2f env=%.1f mod4=%.2f flux=%.1f zcr=%.2f cent=%.2f%s\n",
+				static_cast<double>(at) / hz, f.score, f.tonal, f.beat, f.pause, f.gaps, f.envStd, f.mod4, f.flux, f.zcrCoV, f.centroidCoV,
+				f.quiet ? " QUIET" : "");
+		}
+		printf("windows=%d (%.0f s each, %.0f s in all) weak+=%d moderate+=%d strong+=%d quiet=%d\n",
+			n, windowSec, static_cast<double>(mono.size()) / hz, weak, moderate, strong, quiet);
+		// the app's own route, with ranges served from the file
+		const size_t size = data.size() - 1; // ReadAll adds a terminating zero
+		size_t fetched = 0;
+		const auto d = KHAudio::ClassifyMp3([&](unsigned long long from, unsigned long long to, KHAudio::RangeReply& r) {
+			r = KHAudio::RangeReply();
+			if (from >= size) {
+				return false;
+			}
+			const size_t end = static_cast<size_t>(std::min<unsigned long long>(to + 1, size));
+			r.data.assign(data.begin() + static_cast<std::ptrdiff_t>(from), data.begin() + static_cast<std::ptrdiff_t>(end));
+			r.total = size;
+			r.partial = true;
+			return true;
+		}, &fetched);
+		const auto call = KHAudio::ApplyAlbumContext(d, KHInsider::TitleCue::None, KHAudio::AlbumTally());
+		printf("app route (%zu KB fetched): %ls -> %ls (%ls)\n", fetched / 1024, KHAudio::Describe(d).GetString(),
+			call.skip == SkipReason::None ? L"keep" : L"skip", call.rule);
+		return 0;
+	}
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+	if (argc >= 3 && wcscmp(argv[1], L"--scan") == 0) {
+		return Scan::Run(argv[2], argc >= 4 ? std::max(2.0, _wtof(argv[3])) : 8.0);
+	}
 	if (argc >= 5 && wcscmp(argv[1], L"--eval") == 0) {
 		return Eval::Run(argv[2], argv[3], argv[4]);
 	}

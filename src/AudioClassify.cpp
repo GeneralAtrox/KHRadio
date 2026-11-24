@@ -444,6 +444,36 @@ namespace KHAudio
 		return d;
 	}
 
+	void ApplySpread(Decision& d, const Features* w, int count)
+	{
+		d.spreadJudged = d.spreadTalking = 0;
+		d.spreadTalk = false;
+		for (int i = 0; i < count; i++) {
+			if (!w[i].valid) {
+				continue;
+			}
+			d.spreadJudged++;
+			if (!w[i].quiet && w[i].score >= kModerateScore) {
+				d.spreadTalking++;
+			}
+		}
+		if (d.spreadJudged >= kSpreadMinJudged && d.spreadTalking * 4 >= d.spreadJudged) {
+			d.spreadTalk = true;
+			d.judged = true;
+			d.verdict = KHInsider::AudioVerdict::Spoken;
+			d.strength = std::max(d.strength, Strength::Moderate);
+		}
+	}
+
+	unsigned long long SpreadWindowStart(unsigned long long total, unsigned long long audioStart, int index)
+	{
+		if (index < 0 || index >= kSpreadWindows || total <= audioStart || total - audioStart < kSpreadMinBytes) {
+			return 0;
+		}
+		const unsigned long long slice = (total - audioStart) / kSpreadWindows;
+		return audioStart + slice * static_cast<unsigned long long>(index) + slice / 2 - kSpreadWindowBytes / 2;
+	}
+
 	Decision ClassifyPcmWindows(const std::vector<float>& first, const std::vector<float>& middle, int hz)
 	{
 		Features w[2] = { Analyse(first, hz), Analyse(middle, hz) };
@@ -505,19 +535,21 @@ namespace KHAudio
 	Decision ClassifyMp3(const RangeFetch& fetch, size_t* bytesFetched)
 	{
 		size_t bytes = 0;
-		const auto get = [&](unsigned long long from, RangeReply& reply) {
-			const bool ok = fetch(from, from + kWindowBytes - 1, reply);
+		const auto getBytes = [&](unsigned long long from, size_t want, RangeReply& reply) {
+			const bool ok = fetch(from, from + want - 1, reply);
 			bytes += reply.data.size();
 			return ok && reply.data.size() >= 8192;
 		};
+		const auto get = [&](unsigned long long from, RangeReply& reply) { return getBytes(from, kWindowBytes, reply); };
 		Features w[2];
 		int n = 0;
+		unsigned long long total = 0, audioStart = 0;
 		RangeReply first;
 		if (get(0, first)) {
-			unsigned long long total = first.partial ? first.total : 0;
+			total = first.partial ? first.total : 0;
 			const auto* u = reinterpret_cast<const unsigned char*>(first.data.data());
 			size_t offset = KHInsider::Id3v2TagSize(u, first.data.size());
-			unsigned long long audioStart = offset;
+			audioStart = offset;
 			bool have = true;
 			if (offset > 0 && offset + 65536 > first.data.size()) {
 				// a big ID3 tag (embedded cover art) fills the window: read after it
@@ -540,10 +572,29 @@ namespace KHAudio
 				w[n++] = Analyse(mono, hz);
 			}
 		}
+		Decision d = Decide(w, n);
+		// A long track the first two windows did not call talking: sample it along
+		// its length (see kSpreadWindows).
+		if (n && d.verdict == KHInsider::AudioVerdict::Music && SpreadWindowStart(total, audioStart, 0)) {
+			Features s[kSpreadWindows];
+			int failed = 0;
+			for (int i = 0; i < kSpreadWindows && failed < 3; i++) {
+				RangeReply part;
+				std::vector<float> mono;
+				int hz = 0;
+				if (getBytes(SpreadWindowStart(total, audioStart, i), kSpreadWindowBytes, part) && part.partial
+						&& DecodeMp3(reinterpret_cast<const unsigned char*>(part.data.data()), part.data.size(), 2, 30.0, mono, hz)) {
+					s[i] = Analyse(mono, hz);
+				} else {
+					failed++;
+				}
+			}
+			ApplySpread(d, s, kSpreadWindows);
+		}
 		if (bytesFetched) {
 			*bytesFetched = bytes;
 		}
-		return Decide(w, n);
+		return d;
 	}
 
 	void AlbumTally::Add(const Decision& d)
@@ -564,6 +615,9 @@ namespace KHAudio
 		}
 		if (d.verdict == KHInsider::AudioVerdict::Quiet) {
 			return { SkipReason::Silent, L"silent in every window" };
+		}
+		if (d.spreadTalk) {
+			return { SkipReason::Talking, L"talking at a quarter or more of the points along a long track" };
 		}
 		if (d.verdict != KHInsider::AudioVerdict::Spoken || d.strength == Strength::None) {
 			return { SkipReason::None, L"music" };
@@ -610,6 +664,9 @@ namespace KHAudio
 				s.AppendFormat(L"w%d[%.0fs peak=%.3f flux=%.1f pause=%.2f zcrCoV=%.2f tonal=%.2f mod4=%.2f env=%.1f beat=%.2f cent=%.2f gaps=%.2f s=%+.2f] ",
 					i + 1, f.seconds, f.peak, f.flux, f.pause, f.zcrCoV, f.tonal, f.mod4, f.envStd, f.beat, f.centroidCoV, f.gaps, f.score);
 			}
+		}
+		if (d.spreadJudged) {
+			s.AppendFormat(L"along the track %d/%d talking ", d.spreadTalking, d.spreadJudged);
 		}
 		s.AppendFormat(L"score=%+.2f -> %s", d.score, VerdictName(d));
 		if (d.verdict == KHInsider::AudioVerdict::Spoken) {
